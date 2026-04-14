@@ -174,8 +174,9 @@ function buildOrderRow(o: any) {
     ? (() => {
         const a = o.shippingAddress;
         const name = `${a.firstName} ${a.lastName}`.trim();
-        const street = [a.address1, a.address2].filter(Boolean).join(" ");
-        const cityLine = [a.city, a.provinceCode, a.zip].filter(Boolean).join(" ");
+        const clean = (v: string | null | undefined) => (v && v.trim() && v.trim() !== "-" ? v.trim() : null);
+        const street = [clean(a.address1), clean(a.address2)].filter(Boolean).join(" ");
+        const cityLine = [clean(a.city), clean(a.provinceCode), clean(a.zip)].filter(Boolean).join(" ");
         return [name, street, cityLine].filter(Boolean).join("\n");
       })()
     : "—";
