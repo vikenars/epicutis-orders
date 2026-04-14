@@ -181,10 +181,10 @@ function buildOrderRow(o: any) {
       })()
     : "—";
 
-  const shipToName = o.shippingAddress
-    ? `${o.shippingAddress.firstName} ${o.shippingAddress.lastName}`.trim()
+  const billingName = o.billingAddress
+    ? `${o.billingAddress.firstName} ${o.billingAddress.lastName}`.trim()
     : null;
-  const customerName = o.customer?.displayName || noteCustomer || shipToName || "—";
+  const customerName = o.customer?.displayName || noteCustomer || billingName || "—";
 
   return {
     orderName: o.name,
@@ -220,6 +220,7 @@ const ORDER_GQL = `{
         channelDefinition { channelName }
       }
       customer { displayName }
+      billingAddress { firstName lastName }
       shippingAddress {
         firstName lastName address1 address2 city provinceCode zip
       }
