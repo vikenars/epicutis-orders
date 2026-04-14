@@ -181,7 +181,10 @@ function buildOrderRow(o: any) {
       })()
     : "—";
 
-  const customerName = o.customer?.displayName || noteCustomer || "—";
+  const shipToName = o.shippingAddress
+    ? `${o.shippingAddress.firstName} ${o.shippingAddress.lastName}`.trim()
+    : null;
+  const customerName = o.customer?.displayName || noteCustomer || shipToName || "—";
 
   return {
     orderName: o.name,
