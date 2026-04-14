@@ -181,7 +181,7 @@ function buildOrderRow(o: any) {
       })()
     : "—";
 
-  const customerName = o.customer?.displayName || "—";
+  const customerName = o.customer?.displayName || noteCustomer || "—";
 
   return {
     orderName: o.name,
