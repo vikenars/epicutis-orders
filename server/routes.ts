@@ -181,10 +181,13 @@ function buildOrderRow(o: any) {
       })()
     : "—";
 
+  const customerName = o.customer?.displayName || "—";
+
   return {
     orderName: o.name,
     date: new Date(o.createdAt).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }),
     channel: channel || "—",
+    customerName,
     shipTo,
     items: formatItems(lineItems, fulfillmentMap),
     itemsText: lineItems.map((li: any) => li.title).join(" "),
@@ -213,6 +216,7 @@ const ORDER_GQL = `{
       channelInformation {
         channelDefinition { channelName }
       }
+      customer { displayName }
       shippingAddress {
         firstName lastName address1 address2 city provinceCode zip
       }

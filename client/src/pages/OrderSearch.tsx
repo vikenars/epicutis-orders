@@ -23,6 +23,7 @@ interface Order {
   orderName: string;
   date: string;
   channel: string;
+  customerName: string;
   shipTo: string;
   items: LineItem[];
   subtotal: string;
@@ -74,7 +75,7 @@ function ThemeToggle() {
   );
 }
 
-const COLS = 14; // total columns: Shopify Order #, Zoho Inv #, Date, Channel, Ship To, Items, Subtotal, Total, Fulfillment, Tracking #, Est. Delivery, Note Customer, Order Type (13 data cols + expand in first col)
+const COLS = 15; // total columns: Shopify Order #, Zoho Inv #, Date, Channel, Ship To, Items, Subtotal, Total, Fulfillment, Tracking #, Est. Delivery, Note Customer, Order Type (13 data cols + expand in first col)
 
 function OrderRow({ order, idx }: { order: Order; idx: number }) {
   const [expanded, setExpanded] = useState(false);
@@ -115,6 +116,9 @@ function OrderRow({ order, idx }: { order: Order; idx: number }) {
         </td>
         <td className="px-3 py-3 whitespace-nowrap text-muted-foreground text-xs">{order.date}</td>
         <td className="px-3 py-3 whitespace-nowrap text-xs">{order.channel}</td>
+        <td className="px-3 py-3 whitespace-nowrap text-xs font-medium">
+          {order.customerName !== "—" ? order.customerName : <span className="text-muted-foreground">—</span>}
+        </td>
         <td className="px-3 py-3 text-xs max-w-[180px]">
           <div className="whitespace-pre-line leading-snug">{order.shipTo}</div>
         </td>
@@ -191,8 +195,8 @@ function OrderRow({ order, idx }: { order: Order; idx: number }) {
             <td className="pl-10 pr-3 py-2 whitespace-nowrap">
               <span className="text-xs text-muted-foreground font-mono">{item.sku}</span>
             </td>
-            {/* Title spans Zoho Inv # + Date + Channel + Ship To */}
-            <td colSpan={4} className="px-3 py-2 text-xs text-foreground">
+            {/* Title spans Zoho Inv # + Date + Channel + Customer + Ship To */}
+            <td colSpan={5} className="px-3 py-2 text-xs text-foreground">
               {item.title}
             </td>
             {/* Items col: qty × unit price */}
@@ -447,7 +451,7 @@ export default function OrderSearch() {
               <thead>
                 <tr className="border-b border-border bg-secondary/50">
                   {[
-                    "Shopify Order #", "Zoho Inv #", "Order Date", "Channel", "Ship To", "Items",
+                    "Shopify Order #", "Zoho Inv #", "Order Date", "Channel", "Customer", "Ship To", "Items",
                     "Subtotal", "Total",
                     "Fulfillment", "Tracking #", "Est. Delivery",
                     "Note Customer", "Order Type",
