@@ -74,7 +74,7 @@ function ThemeToggle() {
   );
 }
 
-const COLS = 15; // total columns: Shopify Order #, Zoho Inv #, Date, Channel, Ship To, Items, Subtotal, Shipping, Total, Fulfillment, Tracking #, Est. Delivery, Note Customer, Order Type (14 data cols + expand in first col)
+const COLS = 14; // total columns: Shopify Order #, Zoho Inv #, Date, Channel, Ship To, Items, Subtotal, Total, Fulfillment, Tracking #, Est. Delivery, Note Customer, Order Type (13 data cols + expand in first col)
 
 function OrderRow({ order, idx }: { order: Order; idx: number }) {
   const [expanded, setExpanded] = useState(false);
@@ -115,7 +115,9 @@ function OrderRow({ order, idx }: { order: Order; idx: number }) {
         </td>
         <td className="px-3 py-3 whitespace-nowrap text-muted-foreground text-xs">{order.date}</td>
         <td className="px-3 py-3 whitespace-nowrap text-xs">{order.channel}</td>
-        <td className="px-3 py-3 text-xs max-w-[160px]">{order.shipTo}</td>
+        <td className="px-3 py-3 text-xs max-w-[180px]">
+          <div className="whitespace-pre-line leading-snug">{order.shipTo}</div>
+        </td>
         {/* Items summary — click to expand */}
         <td
           className="px-3 py-3 text-xs text-muted-foreground cursor-pointer select-none"
@@ -127,7 +129,6 @@ function OrderRow({ order, idx }: { order: Order; idx: number }) {
             : "—"}
         </td>
         <td className="px-3 py-3 whitespace-nowrap text-xs tabular-nums">{order.subtotal}</td>
-        <td className="px-3 py-3 whitespace-nowrap text-xs tabular-nums">{order.shipping}</td>
         <td className="px-3 py-3 whitespace-nowrap text-xs tabular-nums font-semibold">{order.total}</td>
         <td className="px-3 py-3 whitespace-nowrap">
           <StatusBadge status={order.fulfillmentStatus} />
@@ -202,8 +203,6 @@ function OrderRow({ order, idx }: { order: Order; idx: number }) {
             <td className="px-3 py-2 text-xs tabular-nums text-muted-foreground whitespace-nowrap">
               {item.lineTotal}
             </td>
-            {/* Shipping col: empty */}
-            <td />
             {/* Total col: empty */}
             <td />
             {/* Fulfillment col: empty */}
@@ -449,7 +448,7 @@ export default function OrderSearch() {
                 <tr className="border-b border-border bg-secondary/50">
                   {[
                     "Shopify Order #", "Zoho Inv #", "Order Date", "Channel", "Ship To", "Items",
-                    "Subtotal", "Shipping", "Total",
+                    "Subtotal", "Total",
                     "Fulfillment", "Tracking #", "Est. Delivery",
                     "Note Customer", "Order Type",
                   ].map((h) => (

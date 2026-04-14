@@ -171,7 +171,13 @@ function buildOrderRow(o: any) {
   const fulfillmentMap = buildFulfillmentMap(fulfillments);
 
   const shipTo = o.shippingAddress
-    ? `${o.shippingAddress.firstName} ${o.shippingAddress.lastName}, ${o.shippingAddress.city} ${o.shippingAddress.provinceCode}`
+    ? (() => {
+        const a = o.shippingAddress;
+        const name = `${a.firstName} ${a.lastName}`.trim();
+        const street = [a.address1, a.address2].filter(Boolean).join(" ");
+        const cityLine = [a.city, a.provinceCode, a.zip].filter(Boolean).join(" ");
+        return [name, street, cityLine].filter(Boolean).join("\n");
+      })()
     : "—";
 
   return {
@@ -207,7 +213,7 @@ const ORDER_GQL = `{
         channelDefinition { channelName }
       }
       shippingAddress {
-        firstName lastName city provinceCode
+        firstName lastName address1 address2 city provinceCode zip
       }
       note
       lineItems(first: 20) {
