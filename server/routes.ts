@@ -354,7 +354,14 @@ async function searchOrders(query: string) {
 
   function matchesQuery(row: any) {
     const haystack = [row._note, row.shipTo, row._skus, row.orderName, row.customerName].join(" ").toLowerCase();
-    return words.every((word) => haystack.includes(word));
+    return words.every((word) => {
+      // Short words (<=2 chars) must match as whole words to avoid false positives
+      // e.g. "v" in "Skin by V" should not match "inv-" or "rive" etc.
+      if (word.length <= 2) {
+        return new RegExp(`(?<![a-z0-9])${word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![a-z0-9])`, "i").test(haystack);
+      }
+      return haystack.includes(word);
+    });
   }
 
   // General keyword — four parallel strategies:
@@ -371,10 +378,22 @@ async function searchOrders(query: string) {
 
   const recentRows = recentOrders.map(buildOrderRow);
 
+  // Build word matchers once (reused for note index scan)
+  const wordMatchers = words.map((word) =>
+    word.length <= 2
+      ? new RegExp(`(?<![a-z0-9])${word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![a-z0-9])`, "i")
+      : null
+  );
+  function noteMatches(noteText: string): boolean {
+    return words.every((word, i) =>
+      wordMatchers[i] ? wordMatchers[i]!.test(noteText) : noteText.includes(word)
+    );
+  }
+
   // Find order names that match in the full note index (covers all history)
   const noteMatchedNames: string[] = [];
   for (const [orderName, noteText] of notes.entries()) {
-    if (words.every((word) => noteText.includes(word))) {
+    if (noteMatches(noteText)) {
       noteMatchedNames.push(orderName);
     }
   }
