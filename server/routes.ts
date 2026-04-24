@@ -351,7 +351,7 @@ async function searchOrders(query: string) {
   const words = q.split(/\s+/).filter(Boolean);
 
   function matchesQuery(row: any) {
-    const haystack = [row._note, row.shipTo, row._skus, row.orderName].join(" ").toLowerCase();
+    const haystack = [row._note, row.shipTo, row._skus, row.orderName, row.customerName].join(" ").toLowerCase();
     return words.every((word) => haystack.includes(word));
   }
 
@@ -361,7 +361,8 @@ async function searchOrders(query: string) {
   // Full-text results are trusted from Shopify so we don't apply the local AND filter to them
   const merged = new Map<string, any>();
   for (const node of fullTextResults) {
-    merged.set(node.name, buildOrderRow(node));
+    const row = buildOrderRow(node);
+    if (matchesQuery(row)) merged.set(node.name, row);
   }
   for (const node of addressResults) {
     const row = buildOrderRow(node);
