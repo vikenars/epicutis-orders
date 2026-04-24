@@ -8,10 +8,12 @@ const SHOPIFY_CLIENT_SECRET = "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";
 let cachedToken: string | null = null;
 let tokenExpiry: number = 0;
 
-// --- Invoice index ---
+// --- Shared order index ---
 // Maps invoice number (lowercase, e.g. "inv-078968") → order name (e.g. "#EPI24831")
-// Built lazily on first invoice search, then refreshed every 30 minutes.
+// Also maps order name → searchable note text (for keyword search across all orders)
+// Built lazily on first use, refreshed every 30 minutes.
 let invoiceIndex: Map<string, string> | null = null;
+let noteIndex: Map<string, string> | null = null; // orderName → full note text (lowercase)
 let invoiceIndexBuiltAt = 0;
 let invoiceIndexBuilding: Promise<void> | null = null;
 const INVOICE_INDEX_TTL = 30 * 60 * 1000; // 30 minutes
@@ -19,25 +21,16 @@ const INVOICE_INDEX_TTL = 30 * 60 * 1000; // 30 minutes
 async function getInvoiceIndex(): Promise<Map<string, string>> {
   const now = Date.now();
   if (invoiceIndex && now - invoiceIndexBuiltAt < INVOICE_INDEX_TTL) return invoiceIndex;
-  // If already building, wait for it
   if (invoiceIndexBuilding) { await invoiceIndexBuilding; return invoiceIndex!; }
 
   invoiceIndexBuilding = (async () => {
     const token = await getAccessToken();
-    const index = new Map<string, string>();
+    const inv = new Map<string, string>();
+    const notes = new Map<string, string>();
     let cursor: string | null = null;
     let hasMore = true;
-    const batchSize = 10; // fetch 10 pages in parallel at a time
 
-    // First pass: get total page count via a single query
     while (hasMore) {
-      // Fetch up to batchSize pages in parallel
-      const cursors: (string | null)[] = [cursor];
-      // We don't know future cursors yet, so fetch sequentially with parallel batching:
-      // Fetch one page, get its endCursor, then do next batch
-      const pagePromises: Promise<{ names: [string, string][]; nextCursor: string | null; hasNext: boolean }>[] = [];
-
-      // Simple sequential pagination — 96 pages × ~150ms = ~15s on first search
       const gql = `{ orders(first: 250${cursor ? `, after: "${cursor}"` : ""}, sortKey: CREATED_AT, reverse: true) {
         edges { node { name note } }
         pageInfo { hasNextPage endCursor }
@@ -53,23 +46,29 @@ async function getInvoiceIndex(): Promise<Map<string, string>> {
       for (const edge of orders?.edges || []) {
         const { name, note } = edge.node;
         if (note) {
-          // Parse INV-XXXXXX from note (format: "INV-XXXXXX | Customer | Type")
           const match = note.match(/inv[-\s]?(\d+)/i);
-          if (match) index.set(`inv-${match[1]}`, name);
+          if (match) inv.set(`inv-${match[1]}`, name);
+          notes.set(name, note.toLowerCase());
         }
       }
       hasMore = orders?.pageInfo?.hasNextPage;
       cursor = orders?.pageInfo?.endCursor || null;
     }
 
-    invoiceIndex = index;
+    invoiceIndex = inv;
+    noteIndex = notes;
     invoiceIndexBuiltAt = Date.now();
-    console.log(`[invoice-index] Built: ${index.size} invoices indexed`);
+    console.log(`[invoice-index] Built: ${inv.size} invoices, ${notes.size} notes indexed`);
   })();
 
   await invoiceIndexBuilding;
   invoiceIndexBuilding = null;
   return invoiceIndex!;
+}
+
+async function getNoteIndex(): Promise<Map<string, string>> {
+  await getInvoiceIndex(); // builds both indexes together
+  return noteIndex!;
 }
 
 async function getAccessToken(): Promise<string> {
@@ -350,20 +349,6 @@ async function searchOrders(query: string) {
     return nodes.map(buildOrderRow).map(stripPrivate);
   }
 
-  // General keyword — three parallel strategies:
-  // 1. Shopify full-text search (covers customer name, email, B2B orders, etc.)
-  // 2. Shopify shipping_address filter
-  // 3. Local scan of recent orders (two pages of 250 = 500) filtered by note/customerName/shipTo/SKU
-  const [fullTextResults, addressResults, recentPage1, recentPage2] = await Promise.all([
-    fetchOrdersByFullTextSearch(query),
-    fetchOrdersFromShopify(`shipping_address:*${query}*`, 50),
-    fetchOrdersFromShopify("", 250),
-    fetchOrdersFromShopifyPage2(250),
-  ]);
-
-  const recentOrders = [...recentPage1, ...recentPage2];
-  const recentRows = recentOrders.map(buildOrderRow);
-
   // Split query into words — ALL words must appear in the haystack (AND logic)
   const words = q.split(/\s+/).filter(Boolean);
 
@@ -372,10 +357,37 @@ async function searchOrders(query: string) {
     return words.every((word) => haystack.includes(word));
   }
 
-  const noteFiltered = recentRows.filter((r) => matchesQuery(r));
+  // General keyword — four parallel strategies:
+  // 1. Shopify full-text search (catches email, some customer names)
+  // 2. Shopify shipping_address filter
+  // 3. Local scan of 250 most recent orders
+  // 4. Note index — covers ALL historical orders (built during invoice index warm-up)
+  const [fullTextResults, addressResults, recentOrders, notes] = await Promise.all([
+    fetchOrdersByFullTextSearch(query),
+    fetchOrdersFromShopify(`shipping_address:*${query}*`, 50),
+    fetchOrdersFromShopify("", 250),
+    getNoteIndex(),
+  ]);
 
-  // Merge: full-text Shopify results first (most relevant), then address, then local note matches
-  // Full-text results are trusted from Shopify so we don't apply the local AND filter to them
+  const recentRows = recentOrders.map(buildOrderRow);
+
+  // Find order names that match in the full note index (covers all history)
+  const noteMatchedNames: string[] = [];
+  for (const [orderName, noteText] of notes.entries()) {
+    if (words.every((word) => noteText.includes(word))) {
+      noteMatchedNames.push(orderName);
+    }
+  }
+
+  // Fetch full order data for note-matched orders not already in recentRows
+  const recentNames = new Set(recentOrders.map((o: any) => o.name));
+  const noteOnlyNames = noteMatchedNames.filter((n) => !recentNames.has(n)).slice(0, 50);
+  const noteOnlyOrders = noteOnlyNames.length > 0
+    ? await Promise.all(noteOnlyNames.map((name) => fetchOrdersFromShopify(`name:${name}`, 1)))
+    : [];
+  const noteOnlyRows = noteOnlyOrders.flat().map(buildOrderRow);
+
+  // Merge all results, applying matchesQuery to everything
   const merged = new Map<string, any>();
   for (const node of fullTextResults) {
     const row = buildOrderRow(node);
@@ -385,8 +397,11 @@ async function searchOrders(query: string) {
     const row = buildOrderRow(node);
     if (!merged.has(node.name) && matchesQuery(row)) merged.set(node.name, row);
   }
-  for (const row of noteFiltered) {
-    if (!merged.has(row.orderName)) merged.set(row.orderName, row);
+  for (const row of recentRows) {
+    if (!merged.has(row.orderName) && matchesQuery(row)) merged.set(row.orderName, row);
+  }
+  for (const row of noteOnlyRows) {
+    if (!merged.has(row.orderName) && matchesQuery(row)) merged.set(row.orderName, row);
   }
 
   return Array.from(merged.values()).slice(0, 50).map(stripPrivate);
