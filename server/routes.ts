@@ -263,10 +263,11 @@ async function fetchOrdersByFullTextSearch(query: string): Promise<any[]> {
   return fetchOrdersFromShopify(query, 50);
 }
 
-async function fetchOrdersFromShopify(shopifyQuery: string, count = 50): Promise<any[]> {
+async function fetchOrdersFromShopify(shopifyQuery: string, count = 50, afterCursor?: string): Promise<any[]> {
   const token = await getAccessToken();
   const queryArg = shopifyQuery ? `, query: "${shopifyQuery}"` : "";
-  const gql = `{ orders(first: ${count}, sortKey: CREATED_AT, reverse: true${queryArg}) ${ORDER_GQL} }`;
+  const cursorArg = afterCursor ? `, after: "${afterCursor}"` : "";
+  const gql = `{ orders(first: ${count}, sortKey: CREATED_AT, reverse: true${queryArg}${cursorArg}) ${ORDER_GQL} }`;
 
   const res = await fetch(`https://${SHOPIFY_STORE}/admin/api/2024-01/graphql.json`, {
     method: "POST",
@@ -277,6 +278,20 @@ async function fetchOrdersFromShopify(shopifyQuery: string, count = 50): Promise
   if (!res.ok) throw new Error("Shopify API request failed");
   const data = (await res.json()) as any;
   return data?.data?.orders?.edges?.map((e: any) => e.node) || [];
+}
+
+async function fetchOrdersFromShopifyPage2(count: number): Promise<any[]> {
+  // Fetch the second page (orders 251-500) by first getting the cursor from page 1
+  const token = await getAccessToken();
+  const cursorRes = await fetch(`https://${SHOPIFY_STORE}/admin/api/2024-01/graphql.json`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Shopify-Access-Token": token },
+    body: JSON.stringify({ query: `{ orders(first: ${count}, sortKey: CREATED_AT, reverse: true) { pageInfo { endCursor } } }` }),
+  });
+  const cursorData = (await cursorRes.json()) as any;
+  const cursor = cursorData?.data?.orders?.pageInfo?.endCursor;
+  if (!cursor) return [];
+  return fetchOrdersFromShopify(``, count, cursor);
 }
 
 async function searchOrders(query: string) {
@@ -338,13 +353,15 @@ async function searchOrders(query: string) {
   // General keyword — three parallel strategies:
   // 1. Shopify full-text search (covers customer name, email, B2B orders, etc.)
   // 2. Shopify shipping_address filter
-  // 3. Local scan of 250 recent orders filtered by note/shipTo/SKU
-  const [fullTextResults, addressResults, recentOrders] = await Promise.all([
+  // 3. Local scan of recent orders (two pages of 250 = 500) filtered by note/customerName/shipTo/SKU
+  const [fullTextResults, addressResults, recentPage1, recentPage2] = await Promise.all([
     fetchOrdersByFullTextSearch(query),
     fetchOrdersFromShopify(`shipping_address:*${query}*`, 50),
     fetchOrdersFromShopify("", 250),
+    fetchOrdersFromShopifyPage2(250),
   ]);
 
+  const recentOrders = [...recentPage1, ...recentPage2];
   const recentRows = recentOrders.map(buildOrderRow);
 
   // Split query into words — ALL words must appear in the haystack (AND logic)
