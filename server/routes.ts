@@ -1,9 +1,30 @@
-import type { Express } from "express";
+import type { Express, Request, Response, NextFunction } from "express";
 import type { Server } from "http";
+import {
+  type AuthUser,
+  canRequestOtp,
+  createSession,
+  deleteSession,
+  generateOtpCode,
+  getSession,
+  isAllowedDomain,
+  resolveUserForEmail,
+  sendOtpEmail,
+  SESSION_TTL_DAYS,
+  storeOtp,
+  verifyOtp,
+} from "./auth";
 
-const SHOPIFY_STORE = "new-epicutis.myshopify.com";
-const SHOPIFY_CLIENT_ID = "deb0bbbfe0cc41d08708460b66c3f8e5";
-const SHOPIFY_CLIENT_SECRET = "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";
+// ── Shopify credentials (env-only) ────────────────────────────────────────────
+// Two supported auth modes for Shopify:
+//   1. Static admin access token (preferred): SHOPIFY_ADMIN_ACCESS_TOKEN
+//   2. Public-app client_credentials flow: SHOPIFY_CLIENT_ID + SHOPIFY_CLIENT_SECRET
+// Either is fine — we pick whichever is set. Never hardcode.
+const SHOPIFY_STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN || "";
+const SHOPIFY_ADMIN_ACCESS_TOKEN = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN || "";
+const SHOPIFY_CLIENT_ID = process.env.SHOPIFY_CLIENT_ID || "";
+const SHOPIFY_CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET || "";
+const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || "2024-01";
 
 let cachedToken: string | null = null;
 let tokenExpiry: number = 0;
@@ -18,6 +39,35 @@ let invoiceIndexBuiltAt = 0;
 let invoiceIndexBuilding: Promise<void> | null = null;
 const INVOICE_INDEX_TTL = 30 * 60 * 1000; // 30 minutes
 
+function shopifyApiUrl(path: string): string {
+  if (!SHOPIFY_STORE_DOMAIN) {
+    throw new Error("SHOPIFY_STORE_DOMAIN is not configured");
+  }
+  return `https://${SHOPIFY_STORE_DOMAIN}${path}`;
+}
+
+// Escape a value before embedding it inside a Shopify GraphQL string literal.
+// Shopify search query strings (e.g. `name:#EPI123` or `shipping_address:*foo*`)
+// are passed inside a `query: "..."` argument in the GQL document we build.
+// Anything the user types must not be able to break out of that string literal
+// or close the surrounding GraphQL block.
+function escapeGqlString(s: string): string {
+  return String(s)
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, " ")
+    .replace(/\r/g, " ");
+}
+
+// For values that are interpolated into a Shopify search query (not raw GraphQL),
+// strip characters that have semantic meaning to Shopify search syntax so a
+// crafted query string can't pivot from one filter to another. Conservative
+// allowlist: alphanumerics, plus a few common punctuation marks safe inside
+// search terms. Wildcard `*` is preserved so existing wildcard usage works.
+function sanitizeShopifySearchTerm(s: string): string {
+  return String(s).replace(/[^A-Za-z0-9 .#@_*\-]/g, "");
+}
+
 async function getInvoiceIndex(): Promise<Map<string, string>> {
   const now = Date.now();
   if (invoiceIndex && now - invoiceIndexBuiltAt < INVOICE_INDEX_TTL) return invoiceIndex;
@@ -31,12 +81,13 @@ async function getInvoiceIndex(): Promise<Map<string, string>> {
     let hasMore = true;
 
     while (hasMore) {
-      const gql = `{ orders(first: 250${cursor ? `, after: "${cursor}"` : ""}, sortKey: CREATED_AT, reverse: true) {
+      const cursorArg = cursor ? `, after: "${escapeGqlString(cursor)}"` : "";
+      const gql = `{ orders(first: 250${cursorArg}, sortKey: CREATED_AT, reverse: true) {
         edges { node { name note } }
         pageInfo { hasNextPage endCursor }
       } }`;
 
-      const res = await fetch(`https://${SHOPIFY_STORE}/admin/api/2024-01/graphql.json`, {
+      const res = await fetch(shopifyApiUrl(`/admin/api/${SHOPIFY_API_VERSION}/graphql.json`), {
         method: "POST",
         headers: { "Content-Type": "application/json", "X-Shopify-Access-Token": token },
         body: JSON.stringify({ query: gql }),
@@ -72,10 +123,20 @@ async function getNoteIndex(): Promise<Map<string, string>> {
 }
 
 async function getAccessToken(): Promise<string> {
+  // Prefer a pre-issued admin access token if the operator has set one.
+  if (SHOPIFY_ADMIN_ACCESS_TOKEN) return SHOPIFY_ADMIN_ACCESS_TOKEN;
+
   const now = Date.now();
   if (cachedToken && now < tokenExpiry) return cachedToken;
 
-  const res = await fetch(`https://${SHOPIFY_STORE}/admin/oauth/access_token`, {
+  if (!SHOPIFY_CLIENT_ID || !SHOPIFY_CLIENT_SECRET) {
+    throw new Error(
+      "Shopify credentials are not configured. Set SHOPIFY_ADMIN_ACCESS_TOKEN, " +
+      "or SHOPIFY_CLIENT_ID + SHOPIFY_CLIENT_SECRET.",
+    );
+  }
+
+  const res = await fetch(shopifyApiUrl(`/admin/oauth/access_token`), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -108,7 +169,6 @@ function formatCurrency(amount: string) {
 }
 
 function buildFulfillmentMap(fulfillments: any[]): Map<string, { trackingNumber: string | null; trackingUrl: string | null; estDelivery: string | null }> {
-  // Maps lineItem id → tracking info from the fulfillment that contains it
   const map = new Map<string, { trackingNumber: string | null; trackingUrl: string | null; estDelivery: string | null }>();
   for (const f of fulfillments || []) {
     const trackingNumber = f.trackingInfo?.[0]?.number || null;
@@ -203,7 +263,6 @@ function buildOrderRow(o: any) {
     invoiceNumber: invoiceNumber || "—",
     noteCustomer: noteCustomer || "—",
     orderType: orderType || "—",
-    // Raw fields for client-side filtering
     _note: o.note || "",
     _skus: lineItems.map((li: any) => `${li.sku || ""} ${li.title || ""}`).join(" "),
   };
@@ -255,20 +314,20 @@ const ORDER_GQL = `{
   }
 }`;
 
-// Searches Shopify's full-text order index (catches B2B orders where customer name
-// isn't in the note or shipping address). Returns nodes ready for buildOrderRow.
 async function fetchOrdersByFullTextSearch(query: string): Promise<any[]> {
-  // Shopify's bare query searches across customer name, email, note, address, etc.
   return fetchOrdersFromShopify(query, 50);
 }
 
+// shopifyQuery is treated as a Shopify search-syntax string. We sanitize the
+// caller's arbitrary substrings before they reach this function; here we just
+// guard against accidental breakouts of the GraphQL string literal.
 async function fetchOrdersFromShopify(shopifyQuery: string, count = 50, afterCursor?: string): Promise<any[]> {
   const token = await getAccessToken();
-  const queryArg = shopifyQuery ? `, query: "${shopifyQuery}"` : "";
-  const cursorArg = afterCursor ? `, after: "${afterCursor}"` : "";
+  const queryArg = shopifyQuery ? `, query: "${escapeGqlString(shopifyQuery)}"` : "";
+  const cursorArg = afterCursor ? `, after: "${escapeGqlString(afterCursor)}"` : "";
   const gql = `{ orders(first: ${count}, sortKey: CREATED_AT, reverse: true${queryArg}${cursorArg}) ${ORDER_GQL} }`;
 
-  const res = await fetch(`https://${SHOPIFY_STORE}/admin/api/2024-01/graphql.json`, {
+  const res = await fetch(shopifyApiUrl(`/admin/api/${SHOPIFY_API_VERSION}/graphql.json`), {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Shopify-Access-Token": token },
     body: JSON.stringify({ query: gql }),
@@ -279,25 +338,10 @@ async function fetchOrdersFromShopify(shopifyQuery: string, count = 50, afterCur
   return data?.data?.orders?.edges?.map((e: any) => e.node) || [];
 }
 
-async function fetchOrdersFromShopifyPage2(count: number): Promise<any[]> {
-  // Fetch the second page (orders 251-500) by first getting the cursor from page 1
-  const token = await getAccessToken();
-  const cursorRes = await fetch(`https://${SHOPIFY_STORE}/admin/api/2024-01/graphql.json`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "X-Shopify-Access-Token": token },
-    body: JSON.stringify({ query: `{ orders(first: ${count}, sortKey: CREATED_AT, reverse: true) { pageInfo { endCursor } } }` }),
-  });
-  const cursorData = (await cursorRes.json()) as any;
-  const cursor = cursorData?.data?.orders?.pageInfo?.endCursor;
-  if (!cursor) return [];
-  return fetchOrdersFromShopify(``, count, cursor);
-}
-
 async function searchOrders(query: string) {
   const q = query.trim().toLowerCase();
 
   if (!q) {
-    // No query — return 50 most recent
     const nodes = await fetchOrdersFromShopify("", 50);
     return nodes.map(buildOrderRow).map(stripPrivate);
   }
@@ -325,23 +369,17 @@ async function searchOrders(query: string) {
     }
   }
 
-  // If the query starts with "0" (like "078976"), treat it as an invoice number with INV- prefix
-  // This check must come BEFORE the order number check (which would also match bare digits)
   const normalizedQ = /^0\d+$/.test(q) ? `inv-${q}` : q;
 
-  // Check if it looks like an invoice number (INV-XXXXXX)
   const invMatch = normalizedQ.match(/^inv[-\s]?(\d+)$/i);
   if (invMatch) {
-    // Use the full invoice index (covers all historical orders, not just recent 250)
     const index = await getInvoiceIndex();
-    const orderName = index.get(normalizedQ); // e.g. "#EPI24831"
+    const orderName = index.get(normalizedQ);
     if (!orderName) return [];
-    // Fetch the full order data by name
     const nodes = await fetchOrdersFromShopify(`name:${orderName}`);
     return nodes.map(buildOrderRow).map(stripPrivate);
   }
 
-  // Check if it looks like an order number (digits, optionally prefixed with EPI or #)
   const orderNumMatch = q.match(/^#?(epi)?(\d+)$/i);
   if (orderNumMatch) {
     const num = orderNumMatch[2];
@@ -349,14 +387,11 @@ async function searchOrders(query: string) {
     return nodes.map(buildOrderRow).map(stripPrivate);
   }
 
-  // Split query into words — ALL words must appear in the haystack (AND logic)
   const words = q.split(/\s+/).filter(Boolean);
 
   function matchesQuery(row: any) {
     const haystack = [row._note, row.shipTo, row._skus, row.orderName, row.customerName].join(" ").toLowerCase();
     return words.every((word) => {
-      // Short words (<=2 chars) must match as whole words to avoid false positives
-      // e.g. "v" in "Skin by V" should not match "inv-" or "rive" etc.
       if (word.length <= 2) {
         return new RegExp(`(?<![a-z0-9])${word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![a-z0-9])`, "i").test(haystack);
       }
@@ -364,21 +399,21 @@ async function searchOrders(query: string) {
     });
   }
 
-  // General keyword — four parallel strategies:
-  // 1. Shopify full-text search (catches email, some customer names)
-  // 2. Shopify shipping_address filter
-  // 3. Local scan of 250 most recent orders
-  // 4. Note index — covers ALL historical orders (built during invoice index warm-up)
+  // Sanitize the user-typed query before building Shopify search-syntax strings.
+  // We pass two flavours of search to Shopify: the bare term (full-text) and a
+  // shipping_address wildcard match. Both must not let the user inject
+  // additional Shopify query operators.
+  const safeTerm = sanitizeShopifySearchTerm(query);
+
   const [fullTextResults, addressResults, recentOrders, notes] = await Promise.all([
-    fetchOrdersByFullTextSearch(query),
-    fetchOrdersFromShopify(`shipping_address:*${query}*`, 50),
+    safeTerm ? fetchOrdersByFullTextSearch(safeTerm) : Promise.resolve([] as any[]),
+    safeTerm ? fetchOrdersFromShopify(`shipping_address:*${safeTerm}*`, 50) : Promise.resolve([] as any[]),
     fetchOrdersFromShopify("", 250),
     getNoteIndex(),
   ]);
 
   const recentRows = recentOrders.map(buildOrderRow);
 
-  // Build word matchers once (reused for note index scan)
   const wordMatchers = words.map((word) =>
     word.length <= 2
       ? new RegExp(`(?<![a-z0-9])${word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![a-z0-9])`, "i")
@@ -390,7 +425,6 @@ async function searchOrders(query: string) {
     );
   }
 
-  // Find order names that match in the full note index (covers all history)
   const noteMatchedNames: string[] = [];
   for (const [orderName, noteText] of notes.entries()) {
     if (noteMatches(noteText)) {
@@ -398,7 +432,6 @@ async function searchOrders(query: string) {
     }
   }
 
-  // Fetch full order data for note-matched orders not already in recentRows
   const recentNames = new Set(recentOrders.map((o: any) => o.name));
   const noteOnlyNames = noteMatchedNames.filter((n) => !recentNames.has(n)).slice(0, 50);
   const noteOnlyOrders = noteOnlyNames.length > 0
@@ -406,7 +439,6 @@ async function searchOrders(query: string) {
     : [];
   const noteOnlyRows = noteOnlyOrders.flat().map(buildOrderRow);
 
-  // Merge all results, applying matchesQuery to everything
   const merged = new Map<string, any>();
   for (const node of fullTextResults) {
     const row = buildOrderRow(node);
@@ -432,18 +464,138 @@ function stripPrivate(row: any) {
 }
 
 export async function warmInvoiceIndex() {
+  // Skip warm-up if Shopify is not configured (e.g. in fresh CI). The first
+  // authenticated request will surface the real config error.
+  if (!SHOPIFY_STORE_DOMAIN) return;
+  if (!SHOPIFY_ADMIN_ACCESS_TOKEN && !(SHOPIFY_CLIENT_ID && SHOPIFY_CLIENT_SECRET)) return;
   await getInvoiceIndex();
 }
 
-export function registerRoutes(httpServer: Server, app: Express) {
-  app.get("/api/orders/search", async (req, res) => {
+// ── Auth middleware ───────────────────────────────────────────────────────────
+interface AuthedRequest extends Request {
+  authUser?: AuthUser;
+  authToken?: string;
+}
+
+function getTokenFromRequest(req: Request): string {
+  const auth = req.headers.authorization || "";
+  return auth.startsWith("Bearer ") ? auth.slice("Bearer ".length).trim() : "";
+}
+
+function requireAuth(req: AuthedRequest, res: Response, next: NextFunction): void {
+  const token = getTokenFromRequest(req);
+  const session = token ? getSession(token) : undefined;
+  if (!session) {
+    res.status(401).json({ error: "Unauthorized" });
+    return;
+  }
+  req.authUser = session.user;
+  req.authToken = token;
+  next();
+}
+
+export function registerRoutes(_httpServer: Server, app: Express) {
+  // ── Health ─────────────────────────────────────────────────────────────────
+  // Cheap endpoint suitable for Railway / Render health checks. Does NOT call
+  // Shopify and does NOT require authentication.
+  app.get("/healthz", (_req, res) => {
+    res.json({ ok: true });
+  });
+  // Compat alias
+  app.get("/health", (_req, res) => {
+    res.json({ ok: true });
+  });
+
+  // ── Auth: request a 6-digit OTP via email ──────────────────────────────────
+  app.post("/api/auth/request-otp", async (req, res) => {
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    if (!email || !email.includes("@")) {
+      res.status(400).json({ error: "Please enter a valid email address." });
+      return;
+    }
+    if (!isAllowedDomain(email)) {
+      res.status(403).json({
+        error: "Sign-in is restricted to @epicutis.com and @signumbio.com email addresses.",
+      });
+      return;
+    }
+    const user = resolveUserForEmail(email);
+    if (!user) {
+      console.warn(`[auth:otp] unmatched email rejected: ${email}`);
+      res.status(403).json({
+        error: "This email is not on the allowlist. Ask an admin to add you.",
+      });
+      return;
+    }
+    const cooldown = canRequestOtp(email);
+    if (!cooldown.ok) {
+      res.status(429).json({
+        error: `Please wait ${Math.ceil(cooldown.retryAfterMs / 1000)}s before requesting another code.`,
+      });
+      return;
+    }
+    const code = generateOtpCode();
+    storeOtp(email, code, user);
+    const result = await sendOtpEmail(email, code);
+    if (!result.ok) {
+      res.status(502).json({ error: result.error || "Could not send sign-in code." });
+      return;
+    }
+    res.json({ ok: true });
+  });
+
+  // ── Auth: verify OTP, mint a session token ─────────────────────────────────
+  app.post("/api/auth/verify-otp", (req, res) => {
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    const code = String(req.body?.code || "").trim();
+    if (!email || !code) {
+      res.status(400).json({ error: "Email and code are required." });
+      return;
+    }
+    const result = verifyOtp(email, code);
+    if (!result.ok) {
+      const messages: Record<string, string> = {
+        not_found: "No active code for this email. Request a new one.",
+        expired: "That code has expired. Request a new one.",
+        too_many_attempts: "Too many incorrect attempts. Request a new code.",
+        wrong_code: "That code is incorrect.",
+      };
+      res.status(401).json({ error: messages[result.reason] || "Invalid code." });
+      return;
+    }
+    const token = createSession(result.user);
+    res.json({ token, user: result.user });
+  });
+
+  app.get("/api/auth/me", requireAuth, (req: AuthedRequest, res) => {
+    res.json({ user: req.authUser });
+  });
+
+  app.post("/api/auth/logout", requireAuth, (req: AuthedRequest, res) => {
+    if (req.authToken) deleteSession(req.authToken);
+    res.json({ ok: true });
+  });
+
+  // Light diagnostic — no secrets, no PII. Useful for debugging deploys.
+  app.get("/api/diagnostics/auth", (_req, res) => {
+    res.json({
+      otp: {
+        enabled: true,
+        provider: process.env.RESEND_API_KEY ? "resend" : "console (dev)",
+        sessionTtlDays: SESSION_TTL_DAYS,
+      },
+    });
+  });
+
+  // ── Order search (auth required) ───────────────────────────────────────────
+  app.get("/api/orders/search", requireAuth, async (req: AuthedRequest, res) => {
     try {
       const query = (req.query.q as string) || "";
       const orders = await searchOrders(query);
       res.json({ orders });
     } catch (err: any) {
-      console.error("Search error:", err);
-      res.status(500).json({ error: err.message || "Search failed" });
+      console.error("Search error:", err?.message || err);
+      res.status(500).json({ error: err?.message || "Search failed" });
     }
   });
 }

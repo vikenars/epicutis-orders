@@ -6,7 +6,7 @@
   },
   "deploy": {
     "startCommand": "npm start",
-    "healthcheckPath": "/api/orders/search?q=",
+    "healthcheckPath": "/healthz",
     "restartPolicyType": "ON_FAILURE"
   }
 }
