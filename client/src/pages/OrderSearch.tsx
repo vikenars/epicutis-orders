@@ -5,7 +5,7 @@ import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Search, Package, ExternalLink, Moon, Sun, ChevronRight, Mic, MicOff } from "lucide-react";
+import { Search, Package, ExternalLink, Moon, Sun, ChevronRight, Mic, MicOff, LogOut } from "lucide-react";
 
 interface LineItem {
   title: string;
@@ -242,7 +242,12 @@ function OrderRow({ order, idx }: { order: Order; idx: number }) {
   );
 }
 
-export default function OrderSearch() {
+interface OrderSearchProps {
+  user?: { email: string; label: string } | null;
+  onLogout?: () => void;
+}
+
+export default function OrderSearch({ user, onLogout }: OrderSearchProps = {}) {
   const [inputValue, setInputValue] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
   const [hasSearched, setHasSearched] = useState(false);
@@ -319,8 +324,18 @@ export default function OrderSearch() {
 
   const { data, isFetching, isError } = useQuery({
     queryKey: ["/api/orders/search", searchQuery],
-    queryFn: () =>
-      apiRequest("GET", `/api/orders/search?q=${encodeURIComponent(searchQuery)}`).then((r) => r.json()),
+    queryFn: async () => {
+      try {
+        const r = await apiRequest("GET", `/api/orders/search?q=${encodeURIComponent(searchQuery)}`);
+        return await r.json();
+      } catch (err: any) {
+        if (typeof err?.message === "string" && err.message.startsWith("401")) {
+          // Session expired — punt back to the login gate.
+          onLogout?.();
+        }
+        throw err;
+      }
+    },
     enabled: hasSearched,
     staleTime: 30_000,
   });
@@ -349,7 +364,25 @@ export default function OrderSearch() {
               <p className="text-xs text-muted-foreground">Order search &amp; lookup</p>
             </div>
           </div>
-          <ThemeToggle />
+          <div className="flex items-center gap-2">
+            {user && (
+              <span className="hidden sm:inline text-xs text-muted-foreground" data-testid="text-user-email">
+                {user.email}
+              </span>
+            )}
+            <ThemeToggle />
+            {onLogout && (
+              <button
+                onClick={onLogout}
+                aria-label="Sign out"
+                title="Sign out"
+                data-testid="button-logout"
+                className="p-2 rounded-lg text-muted-foreground hover:text-foreground hover:bg-secondary transition-colors"
+              >
+                <LogOut size={18} />
+              </button>
+            )}
+          </div>
         </div>
       </header>
 
