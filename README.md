@@ -67,3 +67,8 @@ Secrets are only ever read from `process.env`. Do not commit them.
 Both `railway.json` and `render.yaml` use `/healthz` as the platform health
 check so the loader never has to authenticate or hit Shopify just to keep the
 service marked up.
+
+The build relies on `tsx`, `vite`, and `esbuild`, which live in
+`devDependencies`. Both deploy configs run `npm install --include=dev` so the
+build still pulls them in when the platform sets `NODE_ENV=production` on the
+service (which makes a bare `npm install` skip dev deps).
