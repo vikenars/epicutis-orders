@@ -577,6 +577,8 @@ export function registerRoutes(_httpServer: Server, app: Express) {
   });
 
   // Light diagnostic — no secrets, no PII. Useful for debugging deploys.
+  // Reports presence (boolean) of each required env var so an operator can
+  // verify Railway/Render config without exposing any values.
   app.get("/api/diagnostics/auth", (_req, res) => {
     res.json({
       otp: {
@@ -584,11 +586,39 @@ export function registerRoutes(_httpServer: Server, app: Express) {
         provider: process.env.RESEND_API_KEY ? "resend" : "console (dev)",
         sessionTtlDays: SESSION_TTL_DAYS,
       },
+      shopify: {
+        storeDomainSet: Boolean(SHOPIFY_STORE_DOMAIN),
+        adminAccessTokenSet: Boolean(SHOPIFY_ADMIN_ACCESS_TOKEN),
+        clientIdSet: Boolean(SHOPIFY_CLIENT_ID),
+        clientSecretSet: Boolean(SHOPIFY_CLIENT_SECRET),
+        apiVersion: SHOPIFY_API_VERSION,
+        configured:
+          Boolean(SHOPIFY_STORE_DOMAIN) &&
+          (Boolean(SHOPIFY_ADMIN_ACCESS_TOKEN) ||
+            (Boolean(SHOPIFY_CLIENT_ID) && Boolean(SHOPIFY_CLIENT_SECRET))),
+      },
     });
   });
 
   // ── Order search (auth required) ───────────────────────────────────────────
   app.get("/api/orders/search", requireAuth, async (req: AuthedRequest, res) => {
+    if (!SHOPIFY_STORE_DOMAIN) {
+      res.status(503).json({
+        error:
+          "Shopify is not configured: SHOPIFY_STORE_DOMAIN is missing. Set it in the deploy environment.",
+      });
+      return;
+    }
+    if (
+      !SHOPIFY_ADMIN_ACCESS_TOKEN &&
+      !(SHOPIFY_CLIENT_ID && SHOPIFY_CLIENT_SECRET)
+    ) {
+      res.status(503).json({
+        error:
+          "Shopify is not configured: set SHOPIFY_ADMIN_ACCESS_TOKEN, or SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET.",
+      });
+      return;
+    }
     try {
       const query = (req.query.q as string) || "";
       const orders = await searchOrders(query);
