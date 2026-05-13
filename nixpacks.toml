@@ -1,0 +1,16 @@
+# Nixpacks config for Railway.
+# Pins Node 20 (Vite 7 requires >=20.19) and ensures devDependencies are
+# installed during the build phase even if NODE_ENV=production is set in
+# the deploy environment.
+
+[phases.setup]
+nixPkgs = ["nodejs_20", "npm-10_x"]
+
+[phases.install]
+cmds = ["npm ci --include=dev"]
+
+[phases.build]
+cmds = ["npm run build"]
+
+[start]
+cmd = "npm start"
