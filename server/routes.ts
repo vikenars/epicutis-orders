@@ -366,7 +366,7 @@ async function fetchOrdersFromShopify(shopifyQuery: string, count = 50, afterCur
 
 async function searchOrders(query: string, user: AuthUser) {
   const q = query.trim().toLowerCase();
-  const scope = (rows: any[]) => filterOrdersForUser(rows, user).map(stripPrivate);
+  const scope = (rows: any[]) => filterOrdersForUser(rows, user).map((r) => stripPrivate(r, user));
 
   if (!q) {
     const nodes = await fetchOrdersFromShopify("", 50);
@@ -485,11 +485,17 @@ async function searchOrders(query: string, user: AuthUser) {
   // Apply role-based filter BEFORE the final slice so an AE still gets up to
   // 50 of their own orders even when most matches belong to other reps.
   const filtered = filterOrdersForUser(Array.from(merged.values()), user);
-  return filtered.slice(0, 50).map(stripPrivate);
+  return filtered.slice(0, 50).map((r) => stripPrivate(r, user));
 }
 
-function stripPrivate(row: any) {
-  const { _note, _skus, itemsText, ...rest } = row;
+function stripPrivate(row: any, user: AuthUser) {
+  const { _note, _skus, itemsText, _salesperson, ...rest } = row;
+  // Expose salesperson only to full-visibility roles. AEs already see only
+  // their own orders; surfacing the parsed name adds no value to them and
+  // keeps the field gated to admin/RSD by default.
+  if (user.role === "admin" || user.role === "rsd") {
+    return { ...rest, salesperson: _salesperson || null };
+  }
   return rest;
 }
 

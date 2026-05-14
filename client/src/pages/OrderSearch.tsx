@@ -36,6 +36,9 @@ interface Order {
   invoiceNumber: string;
   noteCustomer: string;
   orderType: string;
+  // Only populated for full-visibility roles (admin / RSD) — parsed from the
+  // 4th pipe-delimited segment of the Shopify order note.
+  salesperson?: string | null;
 }
 
 function StatusBadge({ status }: { status: string }) {
@@ -77,7 +80,7 @@ function ThemeToggle() {
 
 const COLS = 15; // total columns: Shopify Order #, Zoho Inv #, Date, Channel, Ship To, Items, Subtotal, Total, Fulfillment, Tracking #, Est. Delivery, Note Customer, Order Type (13 data cols + expand in first col)
 
-function OrderRow({ order, idx }: { order: Order; idx: number }) {
+function OrderRow({ order, idx, showSalesperson }: { order: Order; idx: number; showSalesperson: boolean }) {
   const [expanded, setExpanded] = useState(false);
   const hasItems = order.items && order.items.length > 0;
 
@@ -180,6 +183,16 @@ function OrderRow({ order, idx }: { order: Order; idx: number }) {
             <span className="text-muted-foreground">—</span>
           )}
         </td>
+        {showSalesperson && (
+          <td
+            className="px-3 py-3 whitespace-nowrap text-xs"
+            data-testid={`text-salesperson-${idx}`}
+          >
+            {order.salesperson
+              ? order.salesperson
+              : <span className="text-muted-foreground">—</span>}
+          </td>
+        )}
       </tr>
 
       {/* Expanded item rows */}
@@ -233,8 +246,8 @@ function OrderRow({ order, idx }: { order: Order; idx: number }) {
             <td className="px-3 py-2 whitespace-nowrap text-xs text-muted-foreground">
               {item.itemEstDelivery || "—"}
             </td>
-            {/* Remaining cols (Note Customer, Order Type) empty */}
-            <td colSpan={2} />
+            {/* Remaining cols (Note Customer, Order Type, optional Salesperson) empty */}
+            <td colSpan={showSalesperson ? 3 : 2} />
           </tr>
         );
       })}
@@ -355,6 +368,9 @@ export default function OrderSearch({ user, onLogout }: OrderSearchProps = {}) {
   const orders: Order[] = data?.orders || [];
   const scope: { role?: string; filtered?: boolean; configured?: boolean } | undefined = data?.scope;
   const aeUnconfigured = scope?.role === "ae" && scope?.configured === false;
+  // Salesperson column is for full-visibility roles only. AEs already see only
+  // their own orders, so the column would just be noise.
+  const showSalesperson = user?.role === "admin" || user?.role === "rsd";
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "Enter") handleSearch();
@@ -516,9 +532,11 @@ export default function OrderSearch({ user, onLogout }: OrderSearchProps = {}) {
                     "Subtotal", "Total",
                     "Fulfillment", "Tracking #", "Est. Delivery",
                     "Note Customer", "Order Type",
+                    ...(showSalesperson ? ["Salesperson"] : []),
                   ].map((h) => (
                     <th
                       key={h}
+                      data-testid={h === "Salesperson" ? "th-salesperson" : undefined}
                       className="px-3 py-3 text-left text-xs font-semibold text-muted-foreground uppercase tracking-wide whitespace-nowrap"
                     >
                       {h}
@@ -528,7 +546,12 @@ export default function OrderSearch({ user, onLogout }: OrderSearchProps = {}) {
               </thead>
               <tbody>
                 {orders.map((order, idx) => (
-                  <OrderRow key={order.orderName} order={order} idx={idx} />
+                  <OrderRow
+                    key={order.orderName}
+                    order={order}
+                    idx={idx}
+                    showSalesperson={showSalesperson}
+                  />
                 ))}
               </tbody>
             </table>
