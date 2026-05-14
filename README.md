@@ -8,8 +8,10 @@ Access is gated by a 6-digit email-OTP flow (no shared password). On every
 sign-in:
 
 1. The user enters their work email. The server checks the domain
-   (`@epicutis.com` / `@signumbio.com`) and the admin allowlist
-   (`ADMIN_EMAILS` env, or the built-in default list).
+   (`@epicutis.com` / `@signumbio.com`). Any allowed-domain user can request
+   a code; their role (and what they actually see) is decided server-side
+   from the `ADMIN_EMAILS` / `RSD_EMAILS` / `AE_SALESPERSONS` env vars —
+   see [Access control](#access-control) below. The default is fail-closed.
 2. The server emails a 6-digit code via Resend (`RESEND_API_KEY`) with a
    10-minute TTL, 5-attempt cap, and a 30-second per-email cooldown.
 3. On verification, the server mints a Bearer session token (7-day sliding
@@ -26,7 +28,7 @@ server console so you can sign in locally without email setup. In
 
 | Method | Path | Auth | Notes |
 | --- | --- | --- | --- |
-| POST | `/api/auth/request-otp` | none | Body: `{ email }`. Sends a code if domain + allowlist pass. |
+| POST | `/api/auth/request-otp` | none | Body: `{ email }`. Sends a code if the email is on an allowed domain. |
 | POST | `/api/auth/verify-otp` | none | Body: `{ email, code }`. Returns `{ token, user }`. |
 | GET | `/api/auth/me` | Bearer | Returns the current `{ user }`. |
 | POST | `/api/auth/logout` | Bearer | Invalidates the current token. |
@@ -51,9 +53,41 @@ deploy:
   - `SHOPIFY_CLIENT_ID` + `SHOPIFY_CLIENT_SECRET`
 - `RESEND_API_KEY` (production)
 - Optional: `ADMIN_EMAILS`, `SHOPIFY_API_VERSION`, `OTP_FROM_ADDRESS`,
-  `OTP_REPLY_TO`
+  `OTP_REPLY_TO`, `RSD_EMAILS`, `AE_SALESPERSONS`
 
 Secrets are only ever read from `process.env`. Do not commit them.
+
+## Access control
+
+Visibility is **fail-closed**. Every signed-in user has a role, and the
+default for any email that is not explicitly listed in one of the env vars
+below is `ae` with zero aliases — i.e. **zero orders visible**, not full
+access.
+
+| Role  | How it is granted | Scope |
+| ----- | ----------------- | ----- |
+| admin | Listed in `ADMIN_EMAILS` (env), or in the built-in default list in `server/auth.ts`. | All orders. |
+| rsd   | Listed in `RSD_EMAILS`. | All orders. (Same scope as admin; distinction is for telemetry / UX.) |
+| ae    | Default for every other allowed-domain user. Aliases are read from `AE_SALESPERSONS`. | Only orders whose salesperson matches one of the user's aliases. |
+
+Salesperson identity is read from the **4th pipe-delimited segment** of
+Shopify's `order.note`:
+
+```
+INV-12345 | Acme Clinic | Reorder | Jose Villegas
+```
+
+Matching is a case-insensitive substring check against the AE's configured
+aliases. An AE with no aliases (not listed in `AE_SALESPERSONS`, or listed
+with an empty array) sees **zero orders** and a "not configured" message in
+the UI. To grant a user full access, add them to `ADMIN_EMAILS` or
+`RSD_EMAILS` — leaving them out of `AE_SALESPERSONS` does NOT grant access.
+
+All filtering happens server-side; the client cannot widen its own scope.
+`/api/orders/search` returns a `scope` object — `{ role, filtered,
+configured }` — so the UI can distinguish "no matches in your book" from
+"your account has no aliases configured." `/api/diagnostics/auth` reports
+the size of each list (counts only, never the actual emails or aliases).
 
 ## Scripts
 

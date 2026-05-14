@@ -1,15 +1,13 @@
 /**
  * Email-OTP authentication for Epicutis Orders.
  *
- * Adapted from epicutis-sales-dashboard/server/auth.ts. The orders app does
- * not need per-rep role resolution, so this is the simpler "admin-only"
- * variant: any allowlisted email on @epicutis.com / @signumbio.com may sign
- * in and access the order data.
- *
  * Hard rules:
- *  - Only @epicutis.com / @signumbio.com can request a code.
- *  - The email must sit on the admin allowlist (ADMIN_EMAILS env or default
- *    list below). Otherwise the request is rejected.
+ *  - Only @epicutis.com / @signumbio.com may request a code.
+ *  - Role is fail-closed: only emails explicitly listed in ADMIN_EMAILS (env
+ *    or the built-in default list) get the admin role; only emails listed in
+ *    RSD_EMAILS get the rsd role. Every other allowed-domain user is treated
+ *    as an AE and only sees orders matching their AE_SALESPERSONS aliases.
+ *    Unconfigured AEs see zero orders, not full data.
  *  - OTP codes are hash-stored, 10-minute TTL, 5-attempt cap per code.
  *  - 30s per-email cooldown between code requests.
  *  - No code is ever logged in production.
@@ -17,9 +15,15 @@
 
 import crypto from "crypto";
 
+export type UserRole = "admin" | "rsd" | "ae";
+
 export interface AuthUser {
   email: string;
   label: string;
+  role: UserRole;
+  // For AE users: lowercased name/alias tokens used to match the salesperson
+  // recorded on a Shopify order. Empty for admin / rsd.
+  salespersonAliases: string[];
 }
 
 // ── Domain allowlist ──────────────────────────────────────────────────────────
@@ -57,12 +61,93 @@ export function isAdminEmail(email: string): boolean {
   return ADMIN_EMAIL_SET.has((email || "").trim().toLowerCase());
 }
 
+// ── Role assignment (env-driven, fail-closed) ─────────────────────────────────
+// Three classes of access:
+//   - admin: full visibility. Granted ONLY to emails on the ADMIN_EMAILS
+//            allowlist (env override, else the built-in default list above).
+//   - rsd:   full visibility. Granted ONLY to emails in RSD_EMAILS.
+//   - ae:    restricted to orders whose salesperson matches the user's
+//            configured aliases in AE_SALESPERSONS. This is the default for
+//            every other allowed-domain user — including emails that are not
+//            mentioned in any of the three env lists. An AE with no aliases
+//            sees zero orders (fail-closed); the UI surfaces a clear
+//            "not configured" message in that case.
+//
+// Configuration:
+//   ADMIN_EMAILS       = "alice@x.com,bob@y.com" (comma list)
+//   RSD_EMAILS         = "carol@x.com,dave@y.com"
+//   AE_SALESPERSONS    = JSON object mapping email -> aliases, e.g.
+//                        {"jvillegas@epicutis.com":["Jose Villegas","JV"]}
+//                        The aliases are the strings written into the
+//                        salesperson position of a Shopify order note. They
+//                        are matched case-insensitively.
+
+function parseEmailListEnv(name: string): Set<string> {
+  const raw = process.env[name] || "";
+  return new Set(
+    raw.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean),
+  );
+}
+
+const RSD_EMAIL_SET = parseEmailListEnv("RSD_EMAILS");
+
+function parseAeSalespersons(): Map<string, string[]> {
+  const raw = (process.env.AE_SALESPERSONS || "").trim();
+  if (!raw) return new Map();
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return new Map();
+    const out = new Map<string, string[]>();
+    for (const [email, aliases] of Object.entries(parsed)) {
+      const e = String(email || "").trim().toLowerCase();
+      if (!e) continue;
+      const list = Array.isArray(aliases)
+        ? aliases
+            .map((s) => String(s || "").trim().toLowerCase())
+            .filter(Boolean)
+        : [];
+      out.set(e, list);
+    }
+    return out;
+  } catch (err) {
+    console.warn("[auth] AE_SALESPERSONS env is not valid JSON — ignoring");
+    return new Map();
+  }
+}
+
+const AE_SALESPERSON_MAP = parseAeSalespersons();
+
+export function resolveRole(email: string): UserRole {
+  const e = (email || "").trim().toLowerCase();
+  // Order matters: admin > rsd > ae. An email that appears in multiple lists
+  // is granted the most privileged role it is explicitly listed in. The
+  // default for everyone else is "ae" — fail-closed, never "admin".
+  if (ADMIN_EMAIL_SET.has(e)) return "admin";
+  if (RSD_EMAIL_SET.has(e)) return "rsd";
+  return "ae";
+}
+
 export function resolveUserForEmail(email: string): AuthUser | null {
   const e = (email || "").trim().toLowerCase();
   if (!e) return null;
   if (!isAllowedDomain(e)) return null;
-  if (!isAdminEmail(e)) return null;
-  return { email: e, label: e };
+  const role = resolveRole(e);
+  // Aliases are only meaningful for AEs. An AE who is not listed in
+  // AE_SALESPERSONS — or whose entry has no aliases — gets an empty list
+  // and will see zero orders (the order filter and UI both surface this).
+  const salespersonAliases =
+    role === "ae" ? (AE_SALESPERSON_MAP.get(e) || []) : [];
+  return { email: e, label: e, role, salespersonAliases };
+}
+
+// Diagnostic counts only — never the values themselves.
+export function roleConfigSummary() {
+  return {
+    adminConfigured: ADMIN_EMAIL_SET.size,
+    rsdConfigured: RSD_EMAIL_SET.size,
+    aeConfigured: AE_SALESPERSON_MAP.size,
+    aeWithAliases: Array.from(AE_SALESPERSON_MAP.values()).filter((v) => v.length > 0).length,
+  };
 }
 
 // ── OTP store ─────────────────────────────────────────────────────────────────
