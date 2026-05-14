@@ -89,6 +89,12 @@ configured }` — so the UI can distinguish "no matches in your book" from
 "your account has no aliases configured." `/api/diagnostics/auth` reports
 the size of each list (counts only, never the actual emails or aliases).
 
+Each order row also carries a `salesperson` field (the parsed 4th
+pipe-delimited segment of `order.note`) **only when the caller is an admin
+or RSD**. AEs do not receive this field — they only ever see their own
+orders, so the column would add no information for them. Server-side
+role-based filtering still uses the same parsed value internally.
+
 ## Scripts
 
 - `npm run dev` — local development server (Vite + Express).
