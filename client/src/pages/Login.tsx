@@ -3,6 +3,7 @@ import { useState, type FormEvent } from "react";
 export interface AuthUser {
   email: string;
   label: string;
+  role?: "admin" | "rsd" | "ae";
 }
 
 interface LoginProps {

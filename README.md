@@ -51,9 +51,32 @@ deploy:
   - `SHOPIFY_CLIENT_ID` + `SHOPIFY_CLIENT_SECRET`
 - `RESEND_API_KEY` (production)
 - Optional: `ADMIN_EMAILS`, `SHOPIFY_API_VERSION`, `OTP_FROM_ADDRESS`,
-  `OTP_REPLY_TO`
+  `OTP_REPLY_TO`, `RSD_EMAILS`, `AE_SALESPERSONS`
 
 Secrets are only ever read from `process.env`. Do not commit them.
+
+## Access control
+
+Every signed-in user has a role:
+
+| Role  | Scope |
+| ----- | ----- |
+| admin | All orders (default for any allowlisted email). |
+| rsd   | All orders. Listed in `RSD_EMAILS`. |
+| ae    | Only orders whose salesperson matches one of the user's aliases in `AE_SALESPERSONS`. |
+
+Salesperson identity is read from the **4th pipe-delimited segment** of
+Shopify's `order.note`:
+
+```
+INV-12345 | Acme Clinic | Reorder | Jose Villegas
+```
+
+Matching is a case-insensitive substring check against the AE's configured
+aliases. If an AE is configured with no aliases the server returns zero
+orders — leave a user out of `AE_SALESPERSONS` entirely to grant admin-level
+access. All filtering happens server-side; the client cannot widen its own
+scope.
 
 ## Scripts
 

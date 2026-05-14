@@ -9,6 +9,7 @@ import {
   getSession,
   isAllowedDomain,
   resolveUserForEmail,
+  roleConfigSummary,
   sendOtpEmail,
   SESSION_TTL_DAYS,
   storeOtp,
@@ -154,12 +155,18 @@ async function getAccessToken(): Promise<string> {
 }
 
 function parseNote(note: string | null | undefined) {
-  if (!note || !note.trim()) return { invoiceNumber: null, noteCustomer: null, orderType: null };
+  if (!note || !note.trim()) {
+    return { invoiceNumber: null, noteCustomer: null, orderType: null, salesperson: null };
+  }
   const parts = note.split("|").map((p) => p.trim());
+  // Historical note format is "invoice | customer | orderType". Some orders
+  // append a 4th pipe-delimited segment with the salesperson / rep name. We
+  // pick that up if present so role-based filtering can match against it.
   return {
     invoiceNumber: parts[0] || null,
     noteCustomer: parts[1] || null,
     orderType: parts[2] || null,
+    salesperson: parts[3] || null,
   };
 }
 
@@ -212,8 +219,8 @@ function formatItems(lineItems: any[], fulfillmentMap: Map<string, any>) {
 function buildOrderRow(o: any) {
   const channel = o.channelInformation?.channelDefinition?.channelName || null;
   const isOnlineStore = channel === "Online Store";
-  const { invoiceNumber, noteCustomer, orderType } = isOnlineStore
-    ? { invoiceNumber: null, noteCustomer: null, orderType: null }
+  const { invoiceNumber, noteCustomer, orderType, salesperson } = isOnlineStore
+    ? { invoiceNumber: null, noteCustomer: null, orderType: null, salesperson: null }
     : parseNote(o.note);
 
   const lineItems = o.lineItems?.edges?.map((li: any) => li.node) || [];
@@ -265,7 +272,26 @@ function buildOrderRow(o: any) {
     orderType: orderType || "—",
     _note: o.note || "",
     _skus: lineItems.map((li: any) => `${li.sku || ""} ${li.title || ""}`).join(" "),
+    _salesperson: salesperson || "",
   };
+}
+
+// Server-side role-based filter. Strips orders that an AE is not allowed to
+// see. RSD/admin pass everything through. Matching uses lowercased substring
+// of the order's salesperson field against any of the AE's aliases.
+function filterOrdersForUser(rows: any[], user: AuthUser): any[] {
+  if (user.role !== "ae") return rows;
+  const aliases = user.salespersonAliases || [];
+  if (aliases.length === 0) {
+    // AE with no configured aliases sees nothing — fail closed so a
+    // mis-configuration does not leak data.
+    return [];
+  }
+  return rows.filter((r) => {
+    const sp = String(r._salesperson || "").toLowerCase();
+    if (!sp) return false;
+    return aliases.some((a) => sp.includes(a));
+  });
 }
 
 const ORDER_GQL = `{
@@ -338,12 +364,13 @@ async function fetchOrdersFromShopify(shopifyQuery: string, count = 50, afterCur
   return data?.data?.orders?.edges?.map((e: any) => e.node) || [];
 }
 
-async function searchOrders(query: string) {
+async function searchOrders(query: string, user: AuthUser) {
   const q = query.trim().toLowerCase();
+  const scope = (rows: any[]) => filterOrdersForUser(rows, user).map(stripPrivate);
 
   if (!q) {
     const nodes = await fetchOrdersFromShopify("", 50);
-    return nodes.map(buildOrderRow).map(stripPrivate);
+    return scope(nodes.map(buildOrderRow));
   }
 
   // --- Comma-separated multi-order lookup (e.g. "EPI24737, EPI24769") ---
@@ -365,7 +392,7 @@ async function searchOrders(query: string) {
           }
         }
       }
-      return merged.map(buildOrderRow).map(stripPrivate);
+      return scope(merged.map(buildOrderRow));
     }
   }
 
@@ -377,14 +404,14 @@ async function searchOrders(query: string) {
     const orderName = index.get(normalizedQ);
     if (!orderName) return [];
     const nodes = await fetchOrdersFromShopify(`name:${orderName}`);
-    return nodes.map(buildOrderRow).map(stripPrivate);
+    return scope(nodes.map(buildOrderRow));
   }
 
   const orderNumMatch = q.match(/^#?(epi)?(\d+)$/i);
   if (orderNumMatch) {
     const num = orderNumMatch[2];
     const nodes = await fetchOrdersFromShopify(`name:#EPI${num}`);
-    return nodes.map(buildOrderRow).map(stripPrivate);
+    return scope(nodes.map(buildOrderRow));
   }
 
   const words = q.split(/\s+/).filter(Boolean);
@@ -455,7 +482,10 @@ async function searchOrders(query: string) {
     if (!merged.has(row.orderName) && matchesQuery(row)) merged.set(row.orderName, row);
   }
 
-  return Array.from(merged.values()).slice(0, 50).map(stripPrivate);
+  // Apply role-based filter BEFORE the final slice so an AE still gets up to
+  // 50 of their own orders even when most matches belong to other reps.
+  const filtered = filterOrdersForUser(Array.from(merged.values()), user);
+  return filtered.slice(0, 50).map(stripPrivate);
 }
 
 function stripPrivate(row: any) {
@@ -475,6 +505,12 @@ export async function warmInvoiceIndex() {
 interface AuthedRequest extends Request {
   authUser?: AuthUser;
   authToken?: string;
+}
+
+// Public projection of AuthUser: drop server-only fields (aliases) before
+// sending the user object back to the browser.
+function publicUser(u: AuthUser) {
+  return { email: u.email, label: u.label, role: u.role };
 }
 
 function getTokenFromRequest(req: Request): string {
@@ -564,11 +600,11 @@ export function registerRoutes(_httpServer: Server, app: Express) {
       return;
     }
     const token = createSession(result.user);
-    res.json({ token, user: result.user });
+    res.json({ token, user: publicUser(result.user) });
   });
 
   app.get("/api/auth/me", requireAuth, (req: AuthedRequest, res) => {
-    res.json({ user: req.authUser });
+    res.json({ user: publicUser(req.authUser!) });
   });
 
   app.post("/api/auth/logout", requireAuth, (req: AuthedRequest, res) => {
@@ -597,6 +633,8 @@ export function registerRoutes(_httpServer: Server, app: Express) {
           (Boolean(SHOPIFY_ADMIN_ACCESS_TOKEN) ||
             (Boolean(SHOPIFY_CLIENT_ID) && Boolean(SHOPIFY_CLIENT_SECRET))),
       },
+      // Counts only — never the actual emails or aliases.
+      roles: roleConfigSummary(),
     });
   });
 
@@ -621,8 +659,17 @@ export function registerRoutes(_httpServer: Server, app: Express) {
     }
     try {
       const query = (req.query.q as string) || "";
-      const orders = await searchOrders(query);
-      res.json({ orders });
+      const user = req.authUser!;
+      const orders = await searchOrders(query, user);
+      res.json({
+        orders,
+        scope: {
+          role: user.role,
+          // Tells the client whether results were filtered to a single AE's
+          // book of business, without leaking the alias list itself.
+          filtered: user.role === "ae",
+        },
+      });
     } catch (err: any) {
       console.error("Search error:", err?.message || err);
       res.status(500).json({ error: err?.message || "Search failed" });

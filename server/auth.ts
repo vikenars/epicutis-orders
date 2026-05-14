@@ -17,9 +17,15 @@
 
 import crypto from "crypto";
 
+export type UserRole = "admin" | "rsd" | "ae";
+
 export interface AuthUser {
   email: string;
   label: string;
+  role: UserRole;
+  // For AE users: lowercased name/alias tokens used to match the salesperson
+  // recorded on a Shopify order. Empty for admin / rsd.
+  salespersonAliases: string[];
 }
 
 // ── Domain allowlist ──────────────────────────────────────────────────────────
@@ -57,12 +63,81 @@ export function isAdminEmail(email: string): boolean {
   return ADMIN_EMAIL_SET.has((email || "").trim().toLowerCase());
 }
 
+// ── Role assignment (env-driven) ──────────────────────────────────────────────
+// Three classes of access:
+//   - admin: full visibility (default for any allowlisted email that is not
+//     otherwise classified — preserves existing behavior).
+//   - rsd:   full visibility, distinguished only for telemetry / future scope.
+//   - ae:    restricted to orders whose salesperson matches the user's
+//            configured aliases.
+//
+// Configuration:
+//   RSD_EMAILS         = "alice@x.com,bob@y.com"
+//   AE_SALESPERSONS    = JSON object mapping email -> aliases, e.g.
+//                        {"jvillegas@epicutis.com":["Jose Villegas","JV"]}
+//                        The aliases are the strings written into the
+//                        salesperson position of a Shopify order note. They
+//                        are matched case-insensitively.
+
+function parseEmailListEnv(name: string): Set<string> {
+  const raw = process.env[name] || "";
+  return new Set(
+    raw.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean),
+  );
+}
+
+const RSD_EMAIL_SET = parseEmailListEnv("RSD_EMAILS");
+
+function parseAeSalespersons(): Map<string, string[]> {
+  const raw = (process.env.AE_SALESPERSONS || "").trim();
+  if (!raw) return new Map();
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return new Map();
+    const out = new Map<string, string[]>();
+    for (const [email, aliases] of Object.entries(parsed)) {
+      const e = String(email || "").trim().toLowerCase();
+      if (!e) continue;
+      const list = Array.isArray(aliases)
+        ? aliases
+            .map((s) => String(s || "").trim().toLowerCase())
+            .filter(Boolean)
+        : [];
+      out.set(e, list);
+    }
+    return out;
+  } catch (err) {
+    console.warn("[auth] AE_SALESPERSONS env is not valid JSON — ignoring");
+    return new Map();
+  }
+}
+
+const AE_SALESPERSON_MAP = parseAeSalespersons();
+
+export function resolveRole(email: string): UserRole {
+  const e = (email || "").trim().toLowerCase();
+  if (AE_SALESPERSON_MAP.has(e)) return "ae";
+  if (RSD_EMAIL_SET.has(e)) return "rsd";
+  return "admin";
+}
+
 export function resolveUserForEmail(email: string): AuthUser | null {
   const e = (email || "").trim().toLowerCase();
   if (!e) return null;
   if (!isAllowedDomain(e)) return null;
   if (!isAdminEmail(e)) return null;
-  return { email: e, label: e };
+  const role = resolveRole(e);
+  const salespersonAliases = role === "ae" ? (AE_SALESPERSON_MAP.get(e) || []) : [];
+  return { email: e, label: e, role, salespersonAliases };
+}
+
+// Diagnostic counts only — never the values themselves.
+export function roleConfigSummary() {
+  return {
+    rsdConfigured: RSD_EMAIL_SET.size,
+    aeConfigured: AE_SALESPERSON_MAP.size,
+    aeWithAliases: Array.from(AE_SALESPERSON_MAP.values()).filter((v) => v.length > 0).length,
+  };
 }
 
 // ── OTP store ─────────────────────────────────────────────────────────────────
