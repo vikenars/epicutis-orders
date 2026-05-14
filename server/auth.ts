@@ -1,15 +1,13 @@
 /**
  * Email-OTP authentication for Epicutis Orders.
  *
- * Adapted from epicutis-sales-dashboard/server/auth.ts. The orders app does
- * not need per-rep role resolution, so this is the simpler "admin-only"
- * variant: any allowlisted email on @epicutis.com / @signumbio.com may sign
- * in and access the order data.
- *
  * Hard rules:
- *  - Only @epicutis.com / @signumbio.com can request a code.
- *  - The email must sit on the admin allowlist (ADMIN_EMAILS env or default
- *    list below). Otherwise the request is rejected.
+ *  - Only @epicutis.com / @signumbio.com may request a code.
+ *  - Role is fail-closed: only emails explicitly listed in ADMIN_EMAILS (env
+ *    or the built-in default list) get the admin role; only emails listed in
+ *    RSD_EMAILS get the rsd role. Every other allowed-domain user is treated
+ *    as an AE and only sees orders matching their AE_SALESPERSONS aliases.
+ *    Unconfigured AEs see zero orders, not full data.
  *  - OTP codes are hash-stored, 10-minute TTL, 5-attempt cap per code.
  *  - 30s per-email cooldown between code requests.
  *  - No code is ever logged in production.
@@ -63,16 +61,21 @@ export function isAdminEmail(email: string): boolean {
   return ADMIN_EMAIL_SET.has((email || "").trim().toLowerCase());
 }
 
-// ── Role assignment (env-driven) ──────────────────────────────────────────────
+// ── Role assignment (env-driven, fail-closed) ─────────────────────────────────
 // Three classes of access:
-//   - admin: full visibility (default for any allowlisted email that is not
-//     otherwise classified — preserves existing behavior).
-//   - rsd:   full visibility, distinguished only for telemetry / future scope.
+//   - admin: full visibility. Granted ONLY to emails on the ADMIN_EMAILS
+//            allowlist (env override, else the built-in default list above).
+//   - rsd:   full visibility. Granted ONLY to emails in RSD_EMAILS.
 //   - ae:    restricted to orders whose salesperson matches the user's
-//            configured aliases.
+//            configured aliases in AE_SALESPERSONS. This is the default for
+//            every other allowed-domain user — including emails that are not
+//            mentioned in any of the three env lists. An AE with no aliases
+//            sees zero orders (fail-closed); the UI surfaces a clear
+//            "not configured" message in that case.
 //
 // Configuration:
-//   RSD_EMAILS         = "alice@x.com,bob@y.com"
+//   ADMIN_EMAILS       = "alice@x.com,bob@y.com" (comma list)
+//   RSD_EMAILS         = "carol@x.com,dave@y.com"
 //   AE_SALESPERSONS    = JSON object mapping email -> aliases, e.g.
 //                        {"jvillegas@epicutis.com":["Jose Villegas","JV"]}
 //                        The aliases are the strings written into the
@@ -116,24 +119,31 @@ const AE_SALESPERSON_MAP = parseAeSalespersons();
 
 export function resolveRole(email: string): UserRole {
   const e = (email || "").trim().toLowerCase();
-  if (AE_SALESPERSON_MAP.has(e)) return "ae";
+  // Order matters: admin > rsd > ae. An email that appears in multiple lists
+  // is granted the most privileged role it is explicitly listed in. The
+  // default for everyone else is "ae" — fail-closed, never "admin".
+  if (ADMIN_EMAIL_SET.has(e)) return "admin";
   if (RSD_EMAIL_SET.has(e)) return "rsd";
-  return "admin";
+  return "ae";
 }
 
 export function resolveUserForEmail(email: string): AuthUser | null {
   const e = (email || "").trim().toLowerCase();
   if (!e) return null;
   if (!isAllowedDomain(e)) return null;
-  if (!isAdminEmail(e)) return null;
   const role = resolveRole(e);
-  const salespersonAliases = role === "ae" ? (AE_SALESPERSON_MAP.get(e) || []) : [];
+  // Aliases are only meaningful for AEs. An AE who is not listed in
+  // AE_SALESPERSONS — or whose entry has no aliases — gets an empty list
+  // and will see zero orders (the order filter and UI both surface this).
+  const salespersonAliases =
+    role === "ae" ? (AE_SALESPERSON_MAP.get(e) || []) : [];
   return { email: e, label: e, role, salespersonAliases };
 }
 
 // Diagnostic counts only — never the values themselves.
 export function roleConfigSummary() {
   return {
+    adminConfigured: ADMIN_EMAIL_SET.size,
     rsdConfigured: RSD_EMAIL_SET.size,
     aeConfigured: AE_SALESPERSON_MAP.size,
     aeWithAliases: Array.from(AE_SALESPERSON_MAP.values()).filter((v) => v.length > 0).length,

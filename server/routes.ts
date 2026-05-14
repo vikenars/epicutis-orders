@@ -661,6 +661,12 @@ export function registerRoutes(_httpServer: Server, app: Express) {
       const query = (req.query.q as string) || "";
       const user = req.authUser!;
       const orders = await searchOrders(query, user);
+      // An AE with no aliases is "not configured": filtering will have
+      // dropped everything to zero. Surface this to the client as a
+      // separate signal from a plain empty result set so the UI can show a
+      // clear configuration message instead of a generic "no orders" line.
+      const aeUnconfigured =
+        user.role === "ae" && (user.salespersonAliases || []).length === 0;
       res.json({
         orders,
         scope: {
@@ -668,6 +674,7 @@ export function registerRoutes(_httpServer: Server, app: Express) {
           // Tells the client whether results were filtered to a single AE's
           // book of business, without leaking the alias list itself.
           filtered: user.role === "ae",
+          configured: !aeUnconfigured,
         },
       });
     } catch (err: any) {

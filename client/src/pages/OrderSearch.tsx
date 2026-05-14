@@ -247,9 +247,13 @@ interface OrderSearchProps {
   onLogout?: () => void;
 }
 
-function roleLabel(role?: string): string | null {
+function roleLabel(role?: string, configured?: boolean): string | null {
   if (!role) return null;
-  if (role === "ae") return "AE — your orders only";
+  if (role === "ae") {
+    return configured === false
+      ? "AE — not configured (zero visibility)"
+      : "AE — your orders only";
+  }
   if (role === "rsd") return "RSD — all orders";
   if (role === "admin") return "Admin — all orders";
   return null;
@@ -349,6 +353,8 @@ export default function OrderSearch({ user, onLogout }: OrderSearchProps = {}) {
   });
 
   const orders: Order[] = data?.orders || [];
+  const scope: { role?: string; filtered?: boolean; configured?: boolean } | undefined = data?.scope;
+  const aeUnconfigured = scope?.role === "ae" && scope?.configured === false;
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "Enter") handleSearch();
@@ -383,7 +389,7 @@ export default function OrderSearch({ user, onLogout }: OrderSearchProps = {}) {
                     className="text-[10px] uppercase tracking-wider text-muted-foreground/80"
                     data-testid="text-user-role"
                   >
-                    {roleLabel(user.role)}
+                    {roleLabel(user.role, scope?.configured)}
                   </span>
                 )}
               </div>
@@ -459,7 +465,9 @@ export default function OrderSearch({ user, onLogout }: OrderSearchProps = {}) {
           {hasSearched && !isFetching && (
             <p className="text-xs text-muted-foreground mt-2">
               {orders.length === 0
-                ? user?.role === "ae"
+                ? aeUnconfigured
+                  ? "Your account has no salesperson aliases configured, so no orders are visible. Ask an admin to add you to ADMIN_EMAILS, RSD_EMAILS, or AE_SALESPERSONS."
+                  : user?.role === "ae"
                   ? "No orders found for your accounts. Results are filtered to orders where you are the salesperson."
                   : "No orders found"
                 : `${orders.length} order${orders.length !== 1 ? "s" : ""} found${searchQuery ? ` for "${searchQuery}"` : ""}${user?.role === "ae" ? " (filtered to your accounts)" : ""}`}
