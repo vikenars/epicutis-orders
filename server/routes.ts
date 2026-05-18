@@ -15,6 +15,12 @@ import {
   storeOtp,
   verifyOtp,
 } from "./auth";
+import {
+  isZohoConfigured,
+  resolveSalespersonFromZoho,
+  zohoCacheStats,
+  zohoConfigSummary,
+} from "./zoho";
 
 // ── Shopify credentials (env-only) ────────────────────────────────────────────
 // Two supported auth modes for Shopify:
@@ -216,12 +222,63 @@ function formatItems(lineItems: any[], fulfillmentMap: Map<string, any>) {
   });
 }
 
+// Pull every Shopify-side hint that might encode a rep name. Live data shows
+// these are usually empty, but if any are ever populated they should win over
+// the Zoho fallback. Tried sources, in priority order:
+//   1. 4th pipe-segment of order.note   (legacy desktop-import convention)
+//   2. customAttributes with a likely "salesperson"-ish key
+//   3. order metafields under custom.salesperson(_name)
+function extractShopifySalesperson(o: any, noteSalesperson: string | null): string | null {
+  if (noteSalesperson && noteSalesperson.trim()) return noteSalesperson.trim();
+
+  const attrs: Array<{ key?: string; value?: string }> = o.customAttributes || [];
+  for (const a of attrs) {
+    const key = String(a?.key || "").trim().toLowerCase();
+    const val = String(a?.value || "").trim();
+    if (!val) continue;
+    if (key === "salesperson" || key === "sales_person" || key === "sales rep" || key === "sales_rep" || key === "rep" || key === "sales-rep") {
+      return val;
+    }
+  }
+
+  const mfEdges: Array<{ node?: { namespace?: string; key?: string; value?: string } }> =
+    o.metafields?.edges || [];
+  for (const e of mfEdges) {
+    const key = String(e.node?.key || "").trim().toLowerCase();
+    const val = String(e.node?.value || "").trim();
+    if (!val) continue;
+    if (key === "salesperson" || key === "salesperson_name" || key === "sales_rep" || key === "rep") {
+      return val;
+    }
+  }
+  return null;
+}
+
+function extractZohoRefs(o: any): { invoice: string | null; salesorder: string | null } {
+  const out: { invoice: string | null; salesorder: string | null } = { invoice: null, salesorder: null };
+  const mfEdges: Array<{ node?: { namespace?: string; key?: string; value?: string } }> =
+    o.metafields?.edges || [];
+  for (const e of mfEdges) {
+    const ns = String(e.node?.namespace || "").trim().toLowerCase();
+    const key = String(e.node?.key || "").trim().toLowerCase();
+    const val = String(e.node?.value || "").trim();
+    if (!val) continue;
+    if (ns !== "custom") continue;
+    if (key === "zoho_invoice") out.invoice = val;
+    else if (key === "zoho_order_reference_number") out.salesorder = val;
+  }
+  return out;
+}
+
 function buildOrderRow(o: any) {
   const channel = o.channelInformation?.channelDefinition?.channelName || null;
   const isOnlineStore = channel === "Online Store";
   const { invoiceNumber, noteCustomer, orderType, salesperson } = isOnlineStore
     ? { invoiceNumber: null, noteCustomer: null, orderType: null, salesperson: null }
     : parseNote(o.note);
+
+  const shopifySalesperson = extractShopifySalesperson(o, salesperson);
+  const zohoRefs = extractZohoRefs(o);
 
   const lineItems = o.lineItems?.edges?.map((li: any) => li.node) || [];
   const fulfillments = o.fulfillments || [];
@@ -272,7 +329,15 @@ function buildOrderRow(o: any) {
     orderType: orderType || "—",
     _note: o.note || "",
     _skus: lineItems.map((li: any) => `${li.sku || ""} ${li.title || ""}`).join(" "),
-    _salesperson: salesperson || "",
+    // Salesperson surfaced by Shopify itself (note pipe-segment, customAttributes
+    // or order metafield). Empty for most orders today — the Zoho fallback fills
+    // in the rest via resolveSalespersonForRows().
+    _shopifySalesperson: shopifySalesperson || "",
+    // Final resolved salesperson (Shopify wins, then Zoho). Filled in by
+    // resolveSalespersonForRows() before role-filtering / stripping happen.
+    _salesperson: shopifySalesperson || "",
+    _zohoInvoice: zohoRefs.invoice || "",
+    _zohoSalesorder: zohoRefs.salesorder || "",
   };
 }
 
@@ -302,6 +367,77 @@ function filterOrdersForUser(rows: any[], user: AuthUser): any[] {
   return rows.filter((r) => rowMatchesAe(r, aliases));
 }
 
+// Resolve salesperson for every row that does not already have a Shopify-side
+// value. Uses the Zoho refs collected in buildOrderRow. Lookups are cached
+// (see server/zoho.ts) so repeating searches and overlapping queries do not
+// hit Zoho for the same invoice twice within the TTL. Counters returned here
+// drive the admin-only diagnostics endpoint.
+interface ResolveCounters {
+  scanned: number;
+  withShopifySalesperson: number;
+  withZohoRefs: number;
+  resolvedFromZoho: number;
+  unresolved: number;
+}
+
+async function resolveSalespersonForRows(rows: any[]): Promise<ResolveCounters> {
+  const counters: ResolveCounters = {
+    scanned: rows.length,
+    withShopifySalesperson: 0,
+    withZohoRefs: 0,
+    resolvedFromZoho: 0,
+    unresolved: 0,
+  };
+
+  const toResolve: any[] = [];
+  for (const r of rows) {
+    if (r._shopifySalesperson) {
+      counters.withShopifySalesperson += 1;
+      continue;
+    }
+    if (r._zohoInvoice || r._zohoSalesorder) {
+      counters.withZohoRefs += 1;
+      toResolve.push(r);
+    }
+  }
+
+  if (toResolve.length > 0 && isZohoConfigured()) {
+    // Bounded concurrency — Zoho rate-limits aggressive callers and we may have
+    // ~50 rows in a single search. The cache means repeat searches are nearly
+    // free regardless.
+    const CONCURRENCY = 8;
+    let i = 0;
+    const worker = async (): Promise<void> => {
+      while (i < toResolve.length) {
+        const row = toResolve[i++];
+        try {
+          const name = await resolveSalespersonFromZoho({
+            invoice: row._zohoInvoice || null,
+            salesorder: row._zohoSalesorder || null,
+          });
+          if (name) {
+            row._salesperson = name;
+            counters.resolvedFromZoho += 1;
+          }
+        } catch (err: any) {
+          console.warn(`[zoho-resolve] failed for ${row.orderName}: ${err?.message || err}`);
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(CONCURRENCY, toResolve.length) }, () => worker()));
+  }
+
+  for (const r of rows) {
+    if (!r._salesperson) counters.unresolved += 1;
+  }
+  return counters;
+}
+
+// Per-session counters from the most recent searchOrders() call, keyed by the
+// caller's email. Drives the admin-only diagnostics endpoint without retaining
+// any order- or customer-level data.
+const lastResolveByUser = new Map<string, { at: number; counters: ResolveCounters }>();
+
 const ORDER_GQL = `{
   edges {
     node {
@@ -317,6 +453,10 @@ const ORDER_GQL = `{
         firstName lastName address1 address2 city provinceCode zip
       }
       note
+      customAttributes { key value }
+      metafields(first: 25, namespace: "custom") {
+        edges { node { namespace key value } }
+      }
       lineItems(first: 20) {
         edges {
           node {
@@ -374,8 +514,14 @@ async function fetchOrdersFromShopify(shopifyQuery: string, count = 50, afterCur
 
 async function searchOrders(query: string, user: AuthUser) {
   const q = query.trim().toLowerCase();
-  const scope = (rows: any[]) =>
-    filterOrdersForUser(rows, user).map((r) => stripPrivate(r, user));
+  // Salesperson on each row may need a Zoho lookup before role-filtering can
+  // run, since AE_SALESPERSONS aliases match the *resolved* rep name. We
+  // resolve, then filter, then strip private fields.
+  const scope = async (rows: any[]) => {
+    const counters = await resolveSalespersonForRows(rows);
+    lastResolveByUser.set(user.email, { at: Date.now(), counters });
+    return filterOrdersForUser(rows, user).map((r) => stripPrivate(r, user));
+  };
 
   if (!q) {
     const nodes = await fetchOrdersFromShopify("", 50);
@@ -491,15 +637,32 @@ async function searchOrders(query: string, user: AuthUser) {
     if (!merged.has(row.orderName) && matchesQuery(row)) merged.set(row.orderName, row);
   }
 
+  // Resolve salesperson for the merged result set (typically <= 250 rows; the
+  // Zoho cache absorbs most calls after the first search). We must resolve
+  // BEFORE role-filtering since AE matching is now done against the resolved
+  // salesperson name, not just the (usually empty) note segment.
+  const mergedRows = Array.from(merged.values());
+  const counters = await resolveSalespersonForRows(mergedRows);
+  lastResolveByUser.set(user.email, { at: Date.now(), counters });
+
   // Apply role-based filtering before the 50-row cap so that AEs can still
   // get up to 50 of their own matches even when the wider merged set contains
   // many rows that belong to other reps.
-  const filtered = filterOrdersForUser(Array.from(merged.values()), user);
+  const filtered = filterOrdersForUser(mergedRows, user);
   return filtered.slice(0, 50).map((r) => stripPrivate(r, user));
 }
 
 function stripPrivate(row: any, user: AuthUser) {
-  const { _note, _skus, itemsText, _salesperson, ...rest } = row;
+  const {
+    _note,
+    _skus,
+    itemsText,
+    _salesperson,
+    _shopifySalesperson,
+    _zohoInvoice,
+    _zohoSalesorder,
+    ...rest
+  } = row;
   // Salesperson is an admin/RSD-only field: AEs can look up any order but do
   // not need to see which other rep owns it.
   if (user.role === "admin" || user.role === "rsd") {
@@ -650,6 +813,27 @@ export function registerRoutes(_httpServer: Server, app: Express) {
       },
       // Counts only — never the actual emails or aliases.
       roles: roleConfigSummary(),
+      zoho: zohoConfigSummary(),
+    });
+  });
+
+  // Admin/RSD-only diagnostics for the salesperson resolver. Reports aggregate
+  // counts from the caller's most recent /api/orders/search call plus the
+  // Zoho cache size. No order names, customer info, references, or secrets
+  // are exposed — only counts.
+  app.get("/api/diagnostics/salesperson", requireAuth, (req: AuthedRequest, res) => {
+    const user = req.authUser!;
+    if (user.role !== "admin" && user.role !== "rsd") {
+      res.status(403).json({ error: "Forbidden" });
+      return;
+    }
+    const last = lastResolveByUser.get(user.email);
+    res.json({
+      zoho: zohoConfigSummary(),
+      cache: zohoCacheStats(),
+      lastSearch: last
+        ? { atMsAgo: Date.now() - last.at, counters: last.counters }
+        : null,
     });
   });
 
