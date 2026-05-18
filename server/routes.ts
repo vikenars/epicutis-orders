@@ -276,11 +276,31 @@ function buildOrderRow(o: any) {
   };
 }
 
-// All authenticated users (AE, RSD, admin) can look up any order and view
-// tracking. The earlier AE salesperson-based result filter was removed because
-// it left AEs with zero visibility after launch. Role still controls which
-// fields are exposed on each row — see `stripPrivate` for the admin/RSD-only
-// `salesperson` field.
+// Server-side AE result filter. AEs may only see orders where the parsed
+// salesperson on the order matches one of their configured aliases (case-
+// insensitive, normalized). Admins and RSDs see all orders. AEs with no
+// aliases configured see zero orders (fail-closed) — the response includes
+// a non-PII `scope` object so the UI can show an actionable message.
+function normalizeAlias(s: string): string {
+  return s.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+function rowMatchesAe(row: any, aliases: string[]): boolean {
+  const sp = normalizeAlias(String(row._salesperson || ""));
+  if (!sp) return false;
+  return aliases.some((a) => {
+    const na = normalizeAlias(a);
+    if (!na) return false;
+    return sp === na || sp.includes(na) || na.includes(sp);
+  });
+}
+
+function filterOrdersForUser(rows: any[], user: AuthUser): any[] {
+  if (user.role === "admin" || user.role === "rsd") return rows;
+  const aliases = user.salespersonAliases || [];
+  if (aliases.length === 0) return [];
+  return rows.filter((r) => rowMatchesAe(r, aliases));
+}
 
 const ORDER_GQL = `{
   edges {
@@ -354,7 +374,8 @@ async function fetchOrdersFromShopify(shopifyQuery: string, count = 50, afterCur
 
 async function searchOrders(query: string, user: AuthUser) {
   const q = query.trim().toLowerCase();
-  const scope = (rows: any[]) => rows.map((r) => stripPrivate(r, user));
+  const scope = (rows: any[]) =>
+    filterOrdersForUser(rows, user).map((r) => stripPrivate(r, user));
 
   if (!q) {
     const nodes = await fetchOrdersFromShopify("", 50);
@@ -470,7 +491,11 @@ async function searchOrders(query: string, user: AuthUser) {
     if (!merged.has(row.orderName) && matchesQuery(row)) merged.set(row.orderName, row);
   }
 
-  return Array.from(merged.values()).slice(0, 50).map((r) => stripPrivate(r, user));
+  // Apply role-based filtering before the 50-row cap so that AEs can still
+  // get up to 50 of their own matches even when the wider merged set contains
+  // many rows that belong to other reps.
+  const filtered = filterOrdersForUser(Array.from(merged.values()), user);
+  return filtered.slice(0, 50).map((r) => stripPrivate(r, user));
 }
 
 function stripPrivate(row: any, user: AuthUser) {
@@ -650,14 +675,21 @@ export function registerRoutes(_httpServer: Server, app: Express) {
     try {
       const query = (req.query.q as string) || "";
       const user = req.authUser!;
-      const orders = await searchOrders(query, user);
+      const isAe = user.role === "ae";
+      const configured = isAe ? user.salespersonAliases.length > 0 : true;
+      // Skip the Shopify round-trip for unconfigured AEs — they would always
+      // get zero results, and we want the UI to surface "not configured"
+      // promptly without paying the Shopify latency.
+      const orders = isAe && !configured ? [] : await searchOrders(query, user);
       res.json({
         orders,
         scope: {
           role: user.role,
-          // Result rows are not narrowed by role any more — every
-          // authenticated user can look up any order.
-          filtered: false,
+          // restricted: server narrowed the result set by role.
+          restricted: isAe,
+          // configured: for AEs, whether AE_SALESPERSONS has any aliases for
+          // this user. Admins/RSDs are always considered configured.
+          configured,
         },
       });
     } catch (err: any) {
