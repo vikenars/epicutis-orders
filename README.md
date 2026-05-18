@@ -9,9 +9,9 @@ sign-in:
 
 1. The user enters their work email. The server checks the domain
    (`@epicutis.com` / `@signumbio.com`). Any allowed-domain user can request
-   a code; their role (and what they actually see) is decided server-side
-   from the `ADMIN_EMAILS` / `RSD_EMAILS` / `AE_SALESPERSONS` env vars —
-   see [Access control](#access-control) below. The default is fail-closed.
+   a code; their role (and which fields they see) is decided server-side
+   from `ADMIN_EMAILS` / `RSD_EMAILS` — see
+   [Access control](#access-control) below.
 2. The server emails a 6-digit code via Resend (`RESEND_API_KEY`) with a
    10-minute TTL, 5-attempt cap, and a 30-second per-email cooldown.
 3. On verification, the server mints a Bearer session token (7-day sliding
@@ -53,47 +53,49 @@ deploy:
   - `SHOPIFY_CLIENT_ID` + `SHOPIFY_CLIENT_SECRET`
 - `RESEND_API_KEY` (production)
 - Optional: `ADMIN_EMAILS`, `SHOPIFY_API_VERSION`, `OTP_FROM_ADDRESS`,
-  `OTP_REPLY_TO`, `RSD_EMAILS`, `AE_SALESPERSONS`
+  `OTP_REPLY_TO`, `RSD_EMAILS`
+- Legacy / unused: `AE_SALESPERSONS` — formerly narrowed AE result sets to
+  their own salesperson rows. AEs now look up any order, so this variable is
+  ignored. Leaving it set is harmless; it can be removed at the next env
+  cleanup.
 
 Secrets are only ever read from `process.env`. Do not commit them.
 
 ## Access control
 
-Visibility is **fail-closed**. Every signed-in user has a role, and the
-default for any email that is not explicitly listed in one of the env vars
-below is `ae` with zero aliases — i.e. **zero orders visible**, not full
-access.
+Order lookup is gated by authentication, not by role. Any user who can
+sign in (allowed domain + valid OTP) can search for any order and view
+its tracking. Roles control which **fields** are exposed on each row, not
+which orders are returned.
 
-| Role  | How it is granted | Scope |
-| ----- | ----------------- | ----- |
-| admin | Listed in `ADMIN_EMAILS` (env), or in the built-in default list in `server/auth.ts`. | All orders. |
-| rsd   | Listed in `RSD_EMAILS`. | All orders. (Same scope as admin; distinction is for telemetry / UX.) |
-| ae    | Default for every other allowed-domain user. Aliases are read from `AE_SALESPERSONS`. | Only orders whose salesperson matches one of the user's aliases. |
+| Role  | How it is granted | Order search | Sensitive fields |
+| ----- | ----------------- | ------------ | ---------------- |
+| admin | Listed in `ADMIN_EMAILS` (env), or in the built-in default list in `server/auth.ts`. | All orders. | Sees `salesperson` and other admin context. |
+| rsd   | Listed in `RSD_EMAILS`. | All orders. | Sees `salesperson` and other admin context. |
+| ae    | Default for every other allowed-domain user. | All orders. | `salesperson` column hidden. |
 
-Salesperson identity is read from the **4th pipe-delimited segment** of
+The `salesperson` field on each row is the 4th pipe-delimited segment of
 Shopify's `order.note`:
 
 ```
 INV-12345 | Acme Clinic | Reorder | Jose Villegas
 ```
 
-Matching is a case-insensitive substring check against the AE's configured
-aliases. An AE with no aliases (not listed in `AE_SALESPERSONS`, or listed
-with an empty array) sees **zero orders** and a "not configured" message in
-the UI. To grant a user full access, add them to `ADMIN_EMAILS` or
-`RSD_EMAILS` — leaving them out of `AE_SALESPERSONS` does NOT grant access.
+It is added to the response **only when the caller is an admin or RSD**.
+AEs never receive it. The frontend mirrors this by hiding the
+`Salesperson` column for AEs, but the server is the source of truth — a
+client cannot widen its own scope.
 
-All filtering happens server-side; the client cannot widen its own scope.
-`/api/orders/search` returns a `scope` object — `{ role, filtered,
-configured }` — so the UI can distinguish "no matches in your book" from
-"your account has no aliases configured." `/api/diagnostics/auth` reports
-the size of each list (counts only, never the actual emails or aliases).
+`/api/diagnostics/auth` reports the size of each role list (counts only,
+never the actual emails or aliases).
 
-Each order row also carries a `salesperson` field (the parsed 4th
-pipe-delimited segment of `order.note`) **only when the caller is an admin
-or RSD**. AEs do not receive this field — they only ever see their own
-orders, so the column would add no information for them. Server-side
-role-based filtering still uses the same parsed value internally.
+### History: AE salesperson filter
+
+Earlier versions of this service filtered AE results to orders whose
+salesperson matched a per-user alias list (`AE_SALESPERSONS`). That filter
+was removed because it left AEs with zero order visibility after launch.
+AEs now look up any order, and `AE_SALESPERSONS` is a no-op kept in
+`.env.example` only to avoid breaking existing deploys.
 
 ## Scripts
 
