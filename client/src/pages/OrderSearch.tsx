@@ -482,7 +482,7 @@ export default function OrderSearch({ user, onLogout }: OrderSearchProps = {}) {
                 ? aeNotConfigured
                   ? "Your account is not yet configured for order visibility. Ask an admin to add your salesperson aliases."
                   : scope.role === "ae" && scope.restricted
-                    ? `No orders assigned to you${searchQuery ? ` for "${searchQuery}"` : ""}`
+                    ? `No orders assigned to you${searchQuery ? ` for "${searchQuery}"` : ""}. Matching uses your work email and name — if you expected to see orders, ask an admin to align your salesperson aliases with what's recorded on the order.`
                     : "No orders found"
                 : `${orders.length} order${orders.length !== 1 ? "s" : ""} found${searchQuery ? ` for "${searchQuery}"` : ""}`}
             </p>

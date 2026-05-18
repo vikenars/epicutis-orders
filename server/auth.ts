@@ -117,6 +117,153 @@ function parseAeSalespersons(): Map<string, string[]> {
 
 const AE_SALESPERSON_MAP = parseAeSalespersons();
 
+// ── Salesperson normalization & matching ─────────────────────────────────────
+// The salesperson field on a Shopify order note is hand-typed by operators and
+// shows up in many shapes: "Jose Villegas", "JOSE VILLEGAS", "Villegas, Jose",
+// "J. Villegas", "salesperson: Jose Villegas", "Jose Villegas (Epicutis)", etc.
+// We normalize aggressively before comparing so AE matching is robust against
+// punctuation, casing, accents, parentheticals, and common labels.
+
+const SALESPERSON_LABEL_RE =
+  /^(?:sales[\s_-]*person|sales[\s_-]*rep|salesrep|sales|rep|account[\s_-]*exec(?:utive)?|ae|owner|assigned[\s_-]*to)\s*[:\-–]\s*/i;
+
+export function normalizeSalespersonValue(raw: string): string {
+  if (!raw) return "";
+  let s = String(raw);
+  // Strip diacritics: "José" → "Jose"
+  s = s.normalize("NFKD").replace(/[̀-ͯ]/g, "");
+  // Drop anything inside parentheses/brackets: "Jose Villegas (Epicutis)" → "Jose Villegas"
+  s = s.replace(/[\(\[\{][^\)\]\}]*[\)\]\}]/g, " ");
+  // Strip common label prefixes like "salesperson:" / "rep -" / "AE:"
+  s = s.replace(SALESPERSON_LABEL_RE, "");
+  // Replace any non-alphanumeric with a space (handles commas, dots, dashes, slashes)
+  s = s.replace(/[^A-Za-z0-9]+/g, " ");
+  return s.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+// Best-effort detection of whether a pipe-segment value LOOKS like a labeled
+// salesperson field. Used by the note parser to find labeled values regardless
+// of segment position.
+export function segmentLooksLikeSalesperson(segment: string): boolean {
+  return SALESPERSON_LABEL_RE.test(String(segment || "").trim());
+}
+
+export function extractSalespersonFromSegment(segment: string): string {
+  const s = String(segment || "");
+  const m = s.match(SALESPERSON_LABEL_RE);
+  if (!m) return s.trim();
+  return s.slice(m[0].length).trim();
+}
+
+// Generate plausible aliases from an email address so that matching can work
+// out of the box for newly added AEs who have not been entered in
+// AE_SALESPERSONS yet. For "jvillegas@epicutis.com" we produce candidates
+// like "jvillegas", "j villegas", "villegas j", and "villegas" (single token
+// trailing surname). These are *additional* hints — explicit aliases in
+// AE_SALESPERSONS always take precedence and are sufficient on their own.
+export function deriveAliasesFromEmail(email: string): string[] {
+  const e = (email || "").trim().toLowerCase();
+  const at = e.indexOf("@");
+  if (at <= 0) return [];
+  const local = e.slice(0, at);
+  // Strip plus-tags ("user+tag" → "user") and common digit suffixes.
+  const baseRaw = local.replace(/\+.*$/, "").replace(/\d+$/, "");
+  const base = baseRaw.replace(/[^a-z]/g, "");
+  if (!base) return [];
+
+  const aliases = new Set<string>();
+  aliases.add(base); // "jvillegas"
+
+  // dot/underscore/dash separator forms — "first.last" → first + last + "first last"
+  const sepMatch = baseRaw.match(/^([a-z]+)[._-]([a-z]+)$/);
+  if (sepMatch) {
+    const first = sepMatch[1];
+    const last = sepMatch[2];
+    if (first && last) {
+      aliases.add(`${first} ${last}`);
+      aliases.add(`${last} ${first}`);
+      aliases.add(`${first[0]} ${last}`);
+      aliases.add(`${first}${last}`);
+      aliases.add(last);
+    }
+    return Array.from(aliases);
+  }
+
+  // "flast" pattern — single leading initial + 3+ char surname → split it.
+  // We only do this for local parts that look like initial+surname (length>=4)
+  // and avoid common ambiguous short locals.
+  if (base.length >= 4 && base.length <= 24) {
+    const first = base[0];
+    const last = base.slice(1);
+    if (last.length >= 3) {
+      aliases.add(`${first} ${last}`);
+      aliases.add(`${last} ${first}`);
+      // Surname-only is intentionally NOT added by default — it would over-
+      // match common surnames typed without a first name. Operators who want
+      // surname-only matching can list it explicitly in AE_SALESPERSONS.
+    }
+  }
+  return Array.from(aliases);
+}
+
+// Combine the configured aliases for an AE with email-derived aliases, all
+// normalized. Returns a deduplicated array of normalized alias strings.
+export function effectiveAliasesForUser(
+  email: string,
+  configuredAliases: string[],
+): string[] {
+  const set = new Set<string>();
+  for (const a of configuredAliases || []) {
+    const n = normalizeSalespersonValue(a);
+    if (n) set.add(n);
+  }
+  for (const a of deriveAliasesFromEmail(email)) {
+    const n = normalizeSalespersonValue(a);
+    if (n) set.add(n);
+  }
+  return Array.from(set);
+}
+
+// Match a raw salesperson value (as parsed from an order note) against an AE's
+// effective aliases. Both sides are normalized first. We accept:
+//   - exact normalized equality;
+//   - token-set containment in either direction (alias tokens ⊆ value tokens
+//     OR value tokens ⊆ alias tokens), so "jose villegas" matches "villegas
+//     jose" and "j villegas" matches "jose villegas";
+//   - whole-token substring match for multi-word aliases (handles
+//     "JV — Epicutis" against alias "jv" only when alias is ≥2 chars).
+// The 1-char surname-only case is rejected to avoid accidental matches.
+export function matchesSalesperson(
+  rawSalesperson: string,
+  normalizedAliases: string[],
+): boolean {
+  const value = normalizeSalespersonValue(rawSalesperson);
+  if (!value) return false;
+  const valueTokens = new Set(value.split(" ").filter(Boolean));
+  for (const alias of normalizedAliases) {
+    if (!alias) continue;
+    if (alias === value) return true;
+    const aliasTokens = alias.split(" ").filter(Boolean);
+    if (aliasTokens.length === 0) continue;
+    // Whole-token containment in either direction.
+    const aliasInValue = aliasTokens.every((t) => valueTokens.has(t));
+    if (aliasInValue) return true;
+    const valueTokensArr = Array.from(valueTokens);
+    if (valueTokensArr.length > 0 && valueTokensArr.every((t) => aliasTokens.includes(t))) {
+      return true;
+    }
+    // Multi-token alias substring match (e.g. alias "jose villegas" should hit
+    // a value of "jose villegas md" once tokens are present — already covered
+    // by token containment above). For a single-token alias of ≥2 chars, do a
+    // whole-word substring match so "jv" hits "jv epicutis" even when the
+    // normalizer left punctuation noise.
+    if (aliasTokens.length === 1 && aliasTokens[0].length >= 2 && valueTokens.has(aliasTokens[0])) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export function resolveRole(email: string): UserRole {
   const e = (email || "").trim().toLowerCase();
   // Order matters: admin > rsd > ae. An email that appears in multiple lists
@@ -132,11 +279,13 @@ export function resolveUserForEmail(email: string): AuthUser | null {
   if (!e) return null;
   if (!isAllowedDomain(e)) return null;
   const role = resolveRole(e);
-  // Aliases are only meaningful for AEs. An AE who is not listed in
-  // AE_SALESPERSONS — or whose entry has no aliases — gets an empty list
-  // and will see zero orders (the order filter and UI both surface this).
+  // For AEs, combine the explicit aliases from AE_SALESPERSONS with aliases
+  // auto-derived from the email local part. This means a newly added AE is
+  // matched against likely "first last" / "flast" / "first.last" variants of
+  // their email out of the box, while operators can still tighten or extend
+  // the list via AE_SALESPERSONS. Admin/RSD roles ignore aliases.
   const salespersonAliases =
-    role === "ae" ? (AE_SALESPERSON_MAP.get(e) || []) : [];
+    role === "ae" ? effectiveAliasesForUser(e, AE_SALESPERSON_MAP.get(e) || []) : [];
   return { email: e, label: e, role, salespersonAliases };
 }
 
@@ -148,6 +297,21 @@ export function roleConfigSummary() {
     aeConfigured: AE_SALESPERSON_MAP.size,
     aeWithAliases: Array.from(AE_SALESPERSON_MAP.values()).filter((v) => v.length > 0).length,
   };
+}
+
+// Admin-only diagnostic: returns every AE's effective normalized alias set
+// (configured + email-derived). This is internal staff data and must only be
+// surfaced to admins by the caller. The values are normalized forms used for
+// matching, not the raw input strings.
+export function listAllAeEffectiveAliases(): Array<{ email: string; aliases: string[] }> {
+  const out: Array<{ email: string; aliases: string[] }> = [];
+  // Include every AE explicitly configured in AE_SALESPERSONS.
+  const seen = new Set<string>();
+  for (const [email, aliases] of AE_SALESPERSON_MAP.entries()) {
+    seen.add(email);
+    out.push({ email, aliases: effectiveAliasesForUser(email, aliases) });
+  }
+  return out;
 }
 
 // ── OTP store ─────────────────────────────────────────────────────────────────

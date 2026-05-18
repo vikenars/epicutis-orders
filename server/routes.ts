@@ -5,11 +5,16 @@ import {
   canRequestOtp,
   createSession,
   deleteSession,
+  extractSalespersonFromSegment,
   generateOtpCode,
   getSession,
   isAllowedDomain,
+  listAllAeEffectiveAliases,
+  matchesSalesperson,
+  normalizeSalespersonValue,
   resolveUserForEmail,
   roleConfigSummary,
+  segmentLooksLikeSalesperson,
   sendOtpEmail,
   SESSION_TTL_DAYS,
   storeOtp,
@@ -160,13 +165,32 @@ function parseNote(note: string | null | undefined) {
   }
   const parts = note.split("|").map((p) => p.trim());
   // Historical note format is "invoice | customer | orderType". Some orders
-  // append a 4th pipe-delimited segment with the salesperson / rep name. We
-  // pick that up if present so role-based filtering can match against it.
+  // append a 4th pipe-delimited segment with the salesperson / rep name —
+  // sometimes as a bare name, sometimes as a labeled "salesperson: Jose
+  // Villegas" pair. The label may also appear in any later segment if an
+  // operator adds it out of order. We prefer a labeled segment when present,
+  // then fall back to the legacy 4th-position bare value.
+  let salesperson: string | null = null;
+  for (let i = 3; i < parts.length; i++) {
+    const p = parts[i];
+    if (p && segmentLooksLikeSalesperson(p)) {
+      salesperson = extractSalespersonFromSegment(p) || null;
+      break;
+    }
+  }
+  if (!salesperson) {
+    const fourth = parts[3];
+    if (fourth) {
+      // The fourth segment may itself be labeled (rare but seen), or be a bare
+      // name. extractSalespersonFromSegment is a no-op when no label is present.
+      salesperson = extractSalespersonFromSegment(fourth) || null;
+    }
+  }
   return {
     invoiceNumber: parts[0] || null,
     noteCustomer: parts[1] || null,
     orderType: parts[2] || null,
-    salesperson: parts[3] || null,
+    salesperson,
   };
 }
 
@@ -277,22 +301,15 @@ function buildOrderRow(o: any) {
 }
 
 // Server-side AE result filter. AEs may only see orders where the parsed
-// salesperson on the order matches one of their configured aliases (case-
-// insensitive, normalized). Admins and RSDs see all orders. AEs with no
-// aliases configured see zero orders (fail-closed) — the response includes
-// a non-PII `scope` object so the UI can show an actionable message.
-function normalizeAlias(s: string): string {
-  return s.trim().toLowerCase().replace(/\s+/g, " ");
-}
-
-function rowMatchesAe(row: any, aliases: string[]): boolean {
-  const sp = normalizeAlias(String(row._salesperson || ""));
-  if (!sp) return false;
-  return aliases.some((a) => {
-    const na = normalizeAlias(a);
-    if (!na) return false;
-    return sp === na || sp.includes(na) || na.includes(sp);
-  });
+// salesperson on the order matches one of their effective aliases (configured
+// aliases plus email-derived ones). The aliases on AuthUser are already
+// normalized; matching here delegates to the shared salesperson matcher so
+// the rules stay consistent with what other surfaces report. Admins and RSDs
+// see all orders. AEs with no aliases see zero orders (fail-closed) — the
+// response includes a non-PII `scope` object so the UI can show an
+// actionable message.
+function rowMatchesAe(row: any, normalizedAliases: string[]): boolean {
+  return matchesSalesperson(String(row._salesperson || ""), normalizedAliases);
 }
 
 function filterOrdersForUser(rows: any[], user: AuthUser): any[] {
@@ -652,6 +669,85 @@ export function registerRoutes(_httpServer: Server, app: Express) {
       roles: roleConfigSummary(),
     });
   });
+
+  // ── Salesperson-matching diagnostics (admin only) ──────────────────────────
+  // Scans recent orders, parses the salesperson field, and reports how
+  // distinct parsed values map onto the effective alias sets of configured
+  // AEs. Surfaces unmapped values so operators can quickly see which note
+  // strings are slipping through and update AE_SALESPERSONS accordingly.
+  //
+  // Restricted to admin/RSD because the parsed salesperson values are
+  // internal staff names, not customer data. No order numbers, customer
+  // names, or line-item data are returned.
+  app.get(
+    "/api/diagnostics/salesperson-matching",
+    requireAuth,
+    async (req: AuthedRequest, res) => {
+      const user = req.authUser!;
+      if (user.role !== "admin" && user.role !== "rsd") {
+        res.status(403).json({ error: "Admin only." });
+        return;
+      }
+      if (!SHOPIFY_STORE_DOMAIN) {
+        res.status(503).json({ error: "Shopify is not configured." });
+        return;
+      }
+      try {
+        const aeEntries = listAllAeEffectiveAliases();
+        // Pre-flatten alias→email map for "who would match this value".
+        const aliasOwners: Array<{ email: string; aliases: string[] }> =
+          aeEntries.map((e) => ({ email: e.email, aliases: e.aliases }));
+
+        // Use the recent-orders note index that we already maintain for
+        // search. It is bounded and refreshed every 30 minutes.
+        const recent = await fetchOrdersFromShopify("", 250);
+        const valueCounts = new Map<string, number>();
+        for (const node of recent) {
+          const channel =
+            node.channelInformation?.channelDefinition?.channelName || null;
+          if (channel === "Online Store") continue;
+          const parsed = parseNote(node.note);
+          const raw = (parsed.salesperson || "").trim();
+          if (!raw) continue;
+          const norm = normalizeSalespersonValue(raw);
+          if (!norm) continue;
+          valueCounts.set(norm, (valueCounts.get(norm) || 0) + 1);
+        }
+
+        const mapped: Array<{ value: string; count: number; matches: string[] }> = [];
+        const unmapped: Array<{ value: string; count: number }> = [];
+        for (const [value, count] of valueCounts.entries()) {
+          const matches: string[] = [];
+          for (const owner of aliasOwners) {
+            if (matchesSalesperson(value, owner.aliases)) matches.push(owner.email);
+          }
+          if (matches.length > 0) mapped.push({ value, count, matches });
+          else unmapped.push({ value, count });
+        }
+        mapped.sort((a, b) => b.count - a.count);
+        unmapped.sort((a, b) => b.count - a.count);
+
+        res.json({
+          scanned: recent.length,
+          distinctSalespersonValues: valueCounts.size,
+          mappedCount: mapped.length,
+          unmappedCount: unmapped.length,
+          aeConfigured: aeEntries.length,
+          // Internal staff names only — never customer data.
+          mapped,
+          unmapped,
+          // Show each AE's effective normalized aliases so an admin can see
+          // exactly what strings they will match against.
+          aeAliases: aeEntries,
+        });
+      } catch (err: any) {
+        console.error("Diagnostics error:", err?.message || err);
+        res
+          .status(500)
+          .json({ error: err?.message || "Diagnostics failed" });
+      }
+    },
+  );
 
   // ── Order search (auth required) ───────────────────────────────────────────
   app.get("/api/orders/search", requireAuth, async (req: AuthedRequest, res) => {
