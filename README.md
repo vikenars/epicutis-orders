@@ -39,6 +39,7 @@ server console so you can sign in locally without email setup. In
 | Method | Path | Auth | Notes |
 | --- | --- | --- | --- |
 | GET | `/api/orders/search?q=…` | Bearer | Searches Shopify orders. Returns `{ orders }`. |
+| GET | `/api/diagnostics/salesperson` | Bearer (admin/RSD) | Aggregate resolver counts. Counts only — never order or customer data. |
 | GET | `/healthz` | none | Cheap liveness check (does not call Shopify). |
 | GET | `/health` | none | Alias for `/healthz`. |
 
@@ -57,6 +58,15 @@ deploy:
 - `AE_SALESPERSONS` — JSON map of AE email → salesperson aliases. **Required
   for AE visibility**: AEs whose email is missing from this map (or whose
   entry has no aliases) see zero orders. Admins and RSDs ignore this map.
+- Zoho Books — **required for AE visibility on the live store**, where the
+  salesperson is not encoded in Shopify itself (see
+  [Salesperson resolution](#salesperson-resolution) below):
+  - `ZOHO_CLIENT_ID`
+  - `ZOHO_CLIENT_SECRET`
+  - `ZOHO_BOOKS_REFRESH_TOKEN` (alias `ZOHO_REFRESH_TOKEN` is also accepted)
+  - `ZOHO_ORG_ID`
+  - Optional: `ZOHO_ACCOUNTS_BASE`, `ZOHO_BOOKS_BASE` (set if your Zoho
+    tenant is in a non-US region).
 
 Secrets are only ever read from `process.env`. Do not commit them.
 
@@ -73,15 +83,10 @@ the client is written.
 | rsd   | Listed in `RSD_EMAILS`. | All orders. | Sees `salesperson` and other admin context. |
 | ae    | Default for every other allowed-domain user. | **Only orders whose salesperson matches one of the AE's aliases in `AE_SALESPERSONS`.** AEs not listed in `AE_SALESPERSONS` see zero orders. | `salesperson` column hidden. |
 
-The `salesperson` field on each row is the 4th pipe-delimited segment of
-Shopify's `order.note`:
-
-```
-INV-12345 | Acme Clinic | Reorder | Jose Villegas
-```
-
-It is added to the response **only when the caller is an admin or RSD**.
-AEs never receive it. The frontend mirrors this by hiding the
+The `salesperson` field on each row is resolved server-side
+(see [Salesperson resolution](#salesperson-resolution) for the full
+pipeline). It is added to the response **only when the caller is an admin
+or RSD**. AEs never receive it. The frontend mirrors this by hiding the
 `Salesperson` column for AEs, but the server is the source of truth — a
 client cannot widen its own scope.
 
@@ -122,6 +127,55 @@ An AE whose email is missing from this map — or whose entry has no
 aliases — sees zero orders (fail-closed). The UI surfaces this as a
 "not configured" message so the rep knows to ask an admin to add their
 aliases rather than thinking the system is broken.
+
+## Salesperson resolution
+
+Live Shopify orders in this account do not carry the salesperson in any
+field we can read: `order.note` pipe-segments, `customAttributes`, order
+metafields, and tags are all empty for the rep on the recent sample we
+checked. `staffMember` would work but requires the `read_users` scope we
+don't have.
+
+Every recent live order *does* carry Zoho cross-references as order
+metafields under the `custom` namespace:
+
+| Metafield                              | What it is                          |
+| -------------------------------------- | ----------------------------------- |
+| `custom.zoho_invoice`                  | Zoho Books invoice number           |
+| `custom.zoho_order_reference_number`   | Zoho Books sales-order number       |
+
+Zoho Books exposes `salesperson_name` on both invoices and sales-orders,
+so the server resolves the rep for each order using whichever reference
+is present. Resolution order, per row:
+
+1. Any explicit Shopify-side salesperson — note 4th pipe-segment,
+   `customAttributes.salesperson` (or common variants), or
+   `metafields.custom.salesperson` / `salesperson_name`. Wins if set.
+2. Zoho Books lookup by `custom.zoho_invoice` (if present), falling back
+   to `custom.zoho_order_reference_number`.
+
+Successful Zoho resolutions are cached in process memory for 6 hours; the
+negative cache (no match) is 15 minutes so a Zoho correction is visible
+within minutes. The cache is keyed by the reference, so the second search
+that touches the same orders pays no Zoho cost. Zoho lookups are issued
+with bounded concurrency (8 in flight) so a wide text search of 50 rows
+that all miss the cache still resolves in a small handful of round-trips.
+
+If Zoho is not configured, AEs effectively see no orders (the
+fail-closed behaviour); admin/RSD still see all orders, just without a
+populated `salesperson` column. The Zoho refresh-token flow is the only
+secret store — refresh tokens never leave `process.env`, access tokens
+only live in memory.
+
+### Diagnostics
+
+- `GET /api/diagnostics/auth` (unauth) reports Shopify + Zoho env
+  presence (booleans only), role list sizes, and OTP provider status.
+- `GET /api/diagnostics/salesperson` (admin/RSD only) reports aggregate
+  counters from the caller's most recent order search — orders scanned,
+  with Shopify salesperson, with Zoho refs, resolved from Zoho,
+  unresolved — plus Zoho cache size. No order names, customer info,
+  references, or secret values are ever exposed.
 
 ## Scripts
 
