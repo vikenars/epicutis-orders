@@ -150,6 +150,24 @@ export function roleConfigSummary() {
   };
 }
 
+// All configured AE users, as AuthUser records. Returned in stable order so
+// the admin/RSD-only visibility diagnostic produces deterministic output.
+// Includes AEs whose entry exists but has no aliases (configured:false from
+// the caller's perspective) so the diagnostic can flag them explicitly.
+export function listConfiguredAes(): AuthUser[] {
+  const out: AuthUser[] = [];
+  for (const [email, aliases] of AE_SALESPERSON_MAP.entries()) {
+    // Skip entries whose email is admin/RSD — those users see all orders
+    // regardless of AE_SALESPERSONS, so simulating AE scope for them would
+    // be misleading.
+    const role = resolveRole(email);
+    if (role !== "ae") continue;
+    out.push({ email, label: email, role: "ae", salespersonAliases: aliases });
+  }
+  out.sort((a, b) => a.email.localeCompare(b.email));
+  return out;
+}
+
 // ── OTP store ─────────────────────────────────────────────────────────────────
 const OTP_TTL_MS = 10 * 60 * 1000;
 const OTP_MAX_ATTEMPTS = 5;
