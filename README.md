@@ -112,10 +112,8 @@ never the actual emails or aliases).
 ### Configuring `AE_SALESPERSONS`
 
 `AE_SALESPERSONS` is a JSON object mapping each AE's email (lowercased)
-to a list of aliases that should match the salesperson string on their
-orders. Matching is normalized (case-insensitive, whitespace-collapsed)
-and accepts substring matches in either direction so common spellings
-("Jose Villegas", "J. Villegas", "JV") all hit.
+to a list of aliases that should match the salesperson string Zoho or
+Shopify records on their orders.
 
 ```json
 {
@@ -124,10 +122,55 @@ and accepts substring matches in either direction so common spellings
 }
 ```
 
+#### Matching rules
+
+Before comparing, both sides are normalized: NFKD diacritic strip
+(`José` → `Jose`), parenthetical removal (`Jose Villegas (Epicutis)` →
+`Jose Villegas`), label stripping (`Salesperson: Jose Villegas`,
+`Rep — Jose`, `AE: Jose`), all non-alphanumerics collapsed to single
+spaces, lowercased. An AE matches a row when, for their effective
+normalized alias set `A` and the normalized resolved salesperson `v`:
+
+1. `v === a` for some `a ∈ A`, **or**
+2. all tokens of some `a ∈ A` are present in `v`'s token set, **or**
+3. all tokens of `v` are present in some `a`'s token set, **or**
+4. `a` is a single token of ≥2 chars and `a ∈ tokens(v)`.
+
+The effective alias set is the configured aliases plus aliases derived
+from the email local part — `jvillegas@…` adds `jvillegas`,
+`j villegas`, `villegas j`; `first.last@…` adds `first last`, `last
+first`, `f last`, `last`. Surname-only is **not** derived from
+`flast`-style locals to avoid over-matching common surnames; list it
+explicitly in `AE_SALESPERSONS` if you want it.
+
+Examples (configured `["Jose Villegas","JV"]` + email
+`jvillegas@epicutis.com`):
+
+- `Jose Villegas` ✅
+- `VILLEGAS, JOSE` ✅
+- `Salesperson: Jose Villegas` ✅
+- `Jose Villegas (Epicutis)` ✅
+- `J. Villegas` ✅
+- `JV` ✅
+- `jvillegas` ✅
+- `Bob Stock` ❌
+
 An AE whose email is missing from this map — or whose entry has no
 aliases — sees zero orders (fail-closed). The UI surfaces this as a
 "not configured" message so the rep knows to ask an admin to add their
 aliases rather than thinking the system is broken.
+
+#### Nickname expansions
+
+A small built-in table in `server/auth.ts`
+(`EMAIL_NICKNAME_ALIASES`) adds nicknames for AEs where production data
+shows Zoho/Shopify uses a form the configured aliases and email-derived
+aliases would not otherwise catch (e.g. `Mel Federico` on Melissa
+Federico's orders). **Only add entries here with explicit production
+evidence** — do not guess nicknames. Prefer extending
+`AE_SALESPERSONS` from the deploy environment when possible; the
+nickname table exists for the cases where the canonical email already
+encodes the formal first name.
 
 ## Salesperson resolution
 
@@ -234,6 +277,50 @@ internal staff labels resolved from Zoho — they appear so the admin can
 diff them against `AE_SALESPERSONS` aliases. The Zoho cache is shared
 with the production search path, so running this audit will not double
 the load on Zoho if a search ran in the same TTL window.
+
+### Known unmapped Zoho salesperson values (operator notes)
+
+A production audit (`/api/diagnostics/ae-visibility?sample=1000`,
+2026-05-19) surfaced the following resolved Zoho salesperson values
+that did not correspond to any configured AE. Some are admins, RSDs,
+or inside-sales aliases where no AE mapping is expected. Others are
+real reps without an `AE_SALESPERSONS` entry — those AEs will see
+zero orders until an entry is added.
+
+Reps that may need an `AE_SALESPERSONS` entry. Do **not** guess emails;
+ask the rep (or HR) for the canonical work email before adding:
+
+| Zoho salesperson | Observed count | Action |
+| --- | --- | --- |
+| Sheila McCrink | 12 | Confirm work email, add `AE_SALESPERSONS["<email>"] = ["Sheila McCrink"]`. |
+| Alma Hernandez-Gonzalez | 4 | Confirm work email. Hyphen is preserved by the normalizer as a space, so `"Alma Hernandez Gonzalez"` and `"Alma Hernandez-Gonzalez"` both match. |
+| Shannon OByrne | 2 | Confirm work email. Note Zoho writes the surname without the apostrophe. The normalizer treats `O'Byrne` and `OByrne` as the same token, so either spelling works once configured. |
+| Vivienne Davis | 1 | Confirm work email. |
+| Mel Federico | 1 | Already handled via `EMAIL_NICKNAME_ALIASES` for `mfederico@epicutis.com` (Melissa Federico). No action needed. |
+
+Values where no `AE_SALESPERSONS` entry is expected — admins/RSDs see
+all orders regardless, and inside-sales values typically aren't tied to
+a single AE: list those in the diagnostics output and skip.
+
+Workflow for adding a new alias:
+
+1. Get the canonical work email from HR or the rep directly. **Never**
+   put a guessed email in `AE_SALESPERSONS` — a wrong email grants the
+   wrong account visibility into someone else's orders.
+2. In the deploy environment, extend `AE_SALESPERSONS` with the new
+   entry. Example JSON patch:
+
+   ```json
+   {
+     "smccrink@epicutis.com": ["Sheila McCrink"],
+     "ahernandez@epicutis.com": ["Alma Hernandez-Gonzalez", "Alma Hernandez Gonzalez"]
+   }
+   ```
+
+3. Redeploy (env changes are read at startup).
+4. Re-run `/api/diagnostics/ae-visibility` and confirm
+   `matchedOrderCount > 0` and the name now appears under
+   `matchedSalespersonNames` instead of `unmatchedResolvedNames`.
 
 ## Scripts
 
