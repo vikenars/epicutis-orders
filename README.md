@@ -40,6 +40,7 @@ server console so you can sign in locally without email setup. In
 | --- | --- | --- | --- |
 | GET | `/api/orders/search?q=…` | Bearer | Searches Shopify orders. Returns `{ orders }`. |
 | GET | `/api/diagnostics/salesperson` | Bearer (admin/RSD) | Aggregate resolver counts. Counts only — never order or customer data. |
+| GET | `/api/diagnostics/ae-visibility` | Bearer (admin/RSD) | Per-AE visibility audit (see [AE visibility audit](#ae-visibility-audit)). |
 | GET | `/healthz` | none | Cheap liveness check (does not call Shopify). |
 | GET | `/health` | none | Alias for `/healthz`. |
 
@@ -176,6 +177,63 @@ only live in memory.
   with Shopify salesperson, with Zoho refs, resolved from Zoho,
   unresolved — plus Zoho cache size. No order names, customer info,
   references, or secret values are ever exposed.
+
+### AE visibility audit
+
+Before launching the tool to a new AE — or after editing
+`AE_SALESPERSONS` — admins/RSDs can confirm that every configured AE
+will see the orders they should, *without* signing in as them.
+
+```
+GET /api/diagnostics/ae-visibility?sample=250&q=
+Authorization: Bearer <admin-or-rsd-token>
+```
+
+The endpoint scans a bounded recent slice of Shopify orders (`sample`
+defaults to 250, max 1000), runs the orders through the **exact same**
+salesperson resolver and the **exact same** AE matcher used by
+`/api/orders/search`, and reports per-AE aggregates only:
+
+```json
+{
+  "sample":   { "requested": 250, "scanned": 250, "q": null },
+  "resolver": { "withShopifySalesperson": 0, "withZohoRefs": 248, "resolvedFromZoho": 246, "unresolved": 4 },
+  "zoho":     { "configured": true, "cache": { "size": 246, "positive": 246, "negative": 0 } },
+  "aes": [
+    {
+      "email": "jvillegas@epicutis.com",
+      "aliases": ["jose villegas", "jv"],
+      "configured": true,
+      "matchedOrderCount": 38,
+      "matchedSalespersonNames": ["jose villegas"]
+    }
+  ],
+  "unmatchedResolvedNames": [ { "name": "k. ramirez", "count": 17 } ]
+}
+```
+
+What admins do with it:
+
+- `matchedOrderCount = 0` for an AE who *should* see orders → their
+  aliases in `AE_SALESPERSONS` do not match what Zoho returns. Compare
+  `aliases` against `matchedSalespersonNames` from another AE or against
+  `unmatchedResolvedNames` to find the spelling Zoho actually uses.
+- `unmatchedResolvedNames` lists real reps that no AE is configured for
+  — every name here is an order that no AE would see. Add an
+  `AE_SALESPERSONS` entry for each one before launch.
+- `resolver.unresolved` tells you how many orders in the sample lack
+  both a Shopify-side salesperson hint and a working Zoho lookup; those
+  orders fall to zero AEs by definition.
+- `q` accepts a substring (e.g. an order name prefix) to narrow the
+  sample to a specific area; useful for spot-checking after fixing one
+  AE's aliases.
+
+The endpoint never returns order IDs, customer names, addresses,
+tracking, or invoice/sales-order numbers. Salesperson names are
+internal staff labels resolved from Zoho — they appear so the admin can
+diff them against `AE_SALESPERSONS` aliases. The Zoho cache is shared
+with the production search path, so running this audit will not double
+the load on Zoho if a search ran in the same TTL window.
 
 ## Scripts
 
