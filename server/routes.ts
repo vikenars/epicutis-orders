@@ -5,12 +5,16 @@ import {
   canRequestOtp,
   createSession,
   deleteSession,
+  extractSalespersonFromSegment,
   generateOtpCode,
   getSession,
   isAllowedDomain,
   listConfiguredAes,
+  matchesSalesperson,
+  normalizeSalespersonValue,
   resolveUserForEmail,
   roleConfigSummary,
+  segmentLooksLikeSalesperson,
   sendOtpEmail,
   SESSION_TTL_DAYS,
   storeOtp,
@@ -167,13 +171,30 @@ function parseNote(note: string | null | undefined) {
   }
   const parts = note.split("|").map((p) => p.trim());
   // Historical note format is "invoice | customer | orderType". Some orders
-  // append a 4th pipe-delimited segment with the salesperson / rep name. We
-  // pick that up if present so role-based filtering can match against it.
+  // append a 4th pipe-delimited segment with the salesperson / rep name —
+  // sometimes as a bare name, sometimes as a labeled "salesperson: Jose
+  // Villegas" pair. The label may also appear in any later segment if an
+  // operator adds it out of order. Prefer a labeled segment when present,
+  // then fall back to the legacy 4th-position bare value.
+  let salesperson: string | null = null;
+  for (let i = 3; i < parts.length; i++) {
+    const p = parts[i];
+    if (p && segmentLooksLikeSalesperson(p)) {
+      salesperson = extractSalespersonFromSegment(p) || null;
+      break;
+    }
+  }
+  if (!salesperson) {
+    const fourth = parts[3];
+    if (fourth) {
+      salesperson = extractSalespersonFromSegment(fourth) || null;
+    }
+  }
   return {
     invoiceNumber: parts[0] || null,
     noteCustomer: parts[1] || null,
     orderType: parts[2] || null,
-    salesperson: parts[3] || null,
+    salesperson,
   };
 }
 
@@ -342,23 +363,16 @@ function buildOrderRow(o: any) {
   };
 }
 
-// Server-side AE result filter. AEs may only see orders where the parsed
-// salesperson on the order matches one of their configured aliases (case-
-// insensitive, normalized). Admins and RSDs see all orders. AEs with no
-// aliases configured see zero orders (fail-closed) — the response includes
-// a non-PII `scope` object so the UI can show an actionable message.
-function normalizeAlias(s: string): string {
-  return s.trim().toLowerCase().replace(/\s+/g, " ");
-}
-
-function rowMatchesAe(row: any, aliases: string[]): boolean {
-  const sp = normalizeAlias(String(row._salesperson || ""));
-  if (!sp) return false;
-  return aliases.some((a) => {
-    const na = normalizeAlias(a);
-    if (!na) return false;
-    return sp === na || sp.includes(na) || na.includes(sp);
-  });
+// Server-side AE result filter. AEs may only see orders where the resolved
+// salesperson on the order matches one of their effective aliases (configured
+// aliases plus email-derived ones, plus any explicit nickname). The aliases
+// on AuthUser are already normalized; matching here delegates to the shared
+// salesperson matcher so the rules stay consistent across the search filter
+// and the audit diagnostic. Admins and RSDs see all orders. AEs with no
+// aliases see zero orders (fail-closed) — the response includes a non-PII
+// `scope` object so the UI can show an actionable message.
+function rowMatchesAe(row: any, normalizedAliases: string[]): boolean {
+  return matchesSalesperson(String(row._salesperson || ""), normalizedAliases);
 }
 
 function filterOrdersForUser(rows: any[], user: AuthUser): any[] {
@@ -914,7 +928,7 @@ export function registerRoutes(_httpServer: Server, app: Express) {
       // a count of "orders attributable to <name>" across the sample.
       const perSalesperson = new Map<string, number>();
       for (const r of rows) {
-        const name = normalizeAlias(String(r._salesperson || ""));
+        const name = normalizeSalespersonValue(String(r._salesperson || ""));
         if (!name) continue;
         perSalesperson.set(name, (perSalesperson.get(name) || 0) + 1);
       }
@@ -929,7 +943,7 @@ export function registerRoutes(_httpServer: Server, app: Express) {
         for (const r of rows) {
           if (rowMatchesAe(r, ae.salespersonAliases)) {
             matched += 1;
-            const sp = normalizeAlias(String(r._salesperson || ""));
+            const sp = normalizeSalespersonValue(String(r._salesperson || ""));
             if (sp) matchedNames.add(sp);
           }
         }
@@ -946,8 +960,6 @@ export function registerRoutes(_httpServer: Server, app: Express) {
       // These are typically reps who don't yet have an AE_SALESPERSONS entry
       // or whose aliases are spelled differently. Showing the names lets an
       // admin fix the config; no order or customer data is exposed.
-      const allAliases = new Set<string>();
-      for (const ae of aes) for (const a of ae.salespersonAliases) allAliases.add(normalizeAlias(a));
       const unmatchedResolvedNames: { name: string; count: number }[] = [];
       for (const [name, count] of perSalesperson.entries()) {
         const matchesAny = aes.some((ae) => rowMatchesAe({ _salesperson: name }, ae.salespersonAliases));
