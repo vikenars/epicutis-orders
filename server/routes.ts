@@ -9,6 +9,7 @@ import {
   generateOtpCode,
   getSession,
   isAllowedDomain,
+  isBlockedEmail,
   listConfiguredAes,
   matchesSalesperson,
   normalizeSalespersonValue,
@@ -781,6 +782,11 @@ export function registerRoutes(_httpServer: Server, app: Express) {
       res.status(400).json({ error: "Please enter a valid email address." });
       return;
     }
+    if (isBlockedEmail(email)) {
+      console.warn(`[auth:otp] blocked email rejected: ${email}`);
+      res.status(403).json({ error: "This account has been disabled." });
+      return;
+    }
     if (!isAllowedDomain(email)) {
       res.status(403).json({
         error: "Sign-in is restricted to @epicutis.com and @signumbio.com email addresses.",
@@ -818,6 +824,11 @@ export function registerRoutes(_httpServer: Server, app: Express) {
     const code = String(req.body?.code || "").trim();
     if (!email || !code) {
       res.status(400).json({ error: "Email and code are required." });
+      return;
+    }
+    if (isBlockedEmail(email)) {
+      console.warn(`[auth:otp] blocked email verify rejected: ${email}`);
+      res.status(403).json({ error: "This account has been disabled." });
       return;
     }
     const result = verifyOtp(email, code);
