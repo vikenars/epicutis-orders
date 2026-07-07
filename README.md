@@ -55,7 +55,7 @@ deploy:
   - `SHOPIFY_CLIENT_ID` + `SHOPIFY_CLIENT_SECRET`
 - `RESEND_API_KEY` (production)
 - Optional: `ADMIN_EMAILS`, `SHOPIFY_API_VERSION`, `OTP_FROM_ADDRESS`,
-  `OTP_REPLY_TO`, `RSD_EMAILS`
+  `OTP_REPLY_TO`, `RSD_EMAILS`, `BLOCKED_EMAILS`
 - `AE_SALESPERSONS` — JSON map of AE email → salesperson aliases. **Required
   for AE visibility**: AEs whose email is missing from this map (or whose
   entry has no aliases) see zero orders. Admins and RSDs ignore this map.
@@ -77,6 +77,17 @@ Sign-in is gated by email-OTP on the allowed domains. Once signed in,
 **which orders you see is decided server-side by role**, and the
 `salesperson` field is restricted to admin/RSD callers regardless of how
 the client is written.
+
+**Revoking access — `BLOCKED_EMAILS`.** A comma-separated denylist checked
+*before* the domain allowlist and all role logic. A blocked email cannot
+request an OTP, cannot verify one, and any session token already issued to it
+is invalidated on its next request — all three paths return `403 {"error":
+"This account has been disabled."}`. This is the correct way to fully revoke
+someone: removing them from `RSD_EMAILS`/`ADMIN_EMAILS` only downgrades their
+role (they would still sign in as an AE), whereas `BLOCKED_EMAILS` denies
+authentication outright. Example: `BLOCKED_EMAILS=abitter@epicutis.com`. The
+list contents are never exposed by the diagnostics endpoints — only a count
+(`roles.blockedConfigured`).
 
 | Role  | How it is granted | Order search | Sensitive fields |
 | ----- | ----------------- | ------------ | ---------------- |

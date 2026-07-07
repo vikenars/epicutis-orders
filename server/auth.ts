@@ -34,6 +34,25 @@ export function isAllowedDomain(email: string): boolean {
   return ALLOWED_DOMAINS.some((d) => lower.endsWith(`@${d}`));
 }
 
+// ── Blocklist (env-driven, fail-closed, highest precedence) ───────────────────
+// Emails in BLOCKED_EMAILS are denied at the authentication layer, ahead of the
+// domain allowlist and all role assignment. A blocked email cannot request an
+// OTP, cannot verify one, and any session token already issued to it stops
+// working on its next request. Comma-separated list, matched case-insensitively.
+//   BLOCKED_EMAILS = "abitter@epicutis.com,someone@signumbio.com"
+const BLOCKED_EMAIL_SET = parseBlockedEmails();
+
+function parseBlockedEmails(): Set<string> {
+  const raw = process.env.BLOCKED_EMAILS || "";
+  return new Set(
+    raw.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean),
+  );
+}
+
+export function isBlockedEmail(email: string): boolean {
+  return BLOCKED_EMAIL_SET.has((email || "").trim().toLowerCase());
+}
+
 // ── Admin allowlist (env override → defaults) ─────────────────────────────────
 const DEFAULT_ADMIN_EMAILS = [
   "bstock@signumbio.com",
@@ -284,6 +303,7 @@ export function resolveRole(email: string): UserRole {
 export function resolveUserForEmail(email: string): AuthUser | null {
   const e = (email || "").trim().toLowerCase();
   if (!e) return null;
+  if (isBlockedEmail(e)) return null;
   if (!isAllowedDomain(e)) return null;
   const role = resolveRole(e);
   // For AEs, combine the explicit aliases from AE_SALESPERSONS with aliases
@@ -300,6 +320,7 @@ export function resolveUserForEmail(email: string): AuthUser | null {
 // Diagnostic counts only — never the values themselves.
 export function roleConfigSummary() {
   return {
+    blockedConfigured: BLOCKED_EMAIL_SET.size,
     adminConfigured: ADMIN_EMAIL_SET.size,
     rsdConfigured: RSD_EMAIL_SET.size,
     aeConfigured: AE_SALESPERSON_MAP.size,
@@ -423,6 +444,12 @@ export function getSession(token: string): Session | undefined {
   const s = sessions.get(token);
   if (!s) return undefined;
   if (s.expiresAt < Date.now()) {
+    sessions.delete(token);
+    return undefined;
+  }
+  // Revoke on the fly if the user has since been added to BLOCKED_EMAILS, so a
+  // previously-issued token cannot be used to keep accessing the site.
+  if (isBlockedEmail(s.user.email)) {
     sessions.delete(token);
     return undefined;
   }
