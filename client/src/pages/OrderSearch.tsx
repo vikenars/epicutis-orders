@@ -36,8 +36,7 @@ interface Order {
   invoiceNumber: string;
   noteCustomer: string;
   orderType: string;
-  // Only populated for full-visibility roles (admin / RSD) — parsed from the
-  // 4th pipe-delimited segment of the Shopify order note.
+  // Attribution field the server sends to admin / RSD callers only.
   salesperson?: string | null;
 }
 
@@ -362,13 +361,9 @@ export default function OrderSearch({ user, onLogout }: OrderSearchProps = {}) {
   });
 
   const orders: Order[] = data?.orders || [];
-  const scope: { role?: string; restricted?: boolean; configured?: boolean } =
-    data?.scope || {};
-  // Salesperson column is admin/RSD-only. AEs are restricted to their own
-  // orders server-side and do not need to see who owns each row.
+  // Every role searches the same full set of orders; the Salesperson column is
+  // an admin/RSD-only field the server withholds from AEs.
   const showSalesperson = user?.role === "admin" || user?.role === "rsd";
-  const aeNotConfigured =
-    scope.role === "ae" && scope.restricted && scope.configured === false;
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "Enter") handleSearch();
@@ -479,11 +474,7 @@ export default function OrderSearch({ user, onLogout }: OrderSearchProps = {}) {
           {hasSearched && !isFetching && (
             <p className="text-xs text-muted-foreground mt-2" data-testid="text-result-summary">
               {orders.length === 0
-                ? aeNotConfigured
-                  ? "Your account is not yet configured for order visibility. Ask an admin to add your salesperson aliases."
-                  : scope.role === "ae" && scope.restricted
-                    ? `No orders assigned to you${searchQuery ? ` for "${searchQuery}"` : ""}. Matching uses your work email and name — if you expected to see orders, ask an admin to align your salesperson aliases with what's recorded on the order.`
-                    : "No orders found"
+                ? `No orders found${searchQuery ? ` for "${searchQuery}"` : ""}`
                 : `${orders.length} order${orders.length !== 1 ? "s" : ""} found${searchQuery ? ` for "${searchQuery}"` : ""}`}
             </p>
           )}

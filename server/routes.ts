@@ -364,23 +364,11 @@ function buildOrderRow(o: any) {
   };
 }
 
-// Server-side AE result filter. AEs may only see orders where the resolved
-// salesperson on the order matches one of their effective aliases (configured
-// aliases plus email-derived ones, plus any explicit nickname). The aliases
-// on AuthUser are already normalized; matching here delegates to the shared
-// salesperson matcher so the rules stay consistent across the search filter
-// and the audit diagnostic. Admins and RSDs see all orders. AEs with no
-// aliases see zero orders (fail-closed) — the response includes a non-PII
-// `scope` object so the UI can show an actionable message.
-function rowMatchesAe(row: any, normalizedAliases: string[]): boolean {
+// Attribution-only helper: does this order's resolved salesperson look like the
+// given AE? Used exclusively by the admin/RSD attribution audit below. It is
+// NOT an access control check — every authenticated user can see every order.
+function rowAttributedToAe(row: any, normalizedAliases: string[]): boolean {
   return matchesSalesperson(String(row._salesperson || ""), normalizedAliases);
-}
-
-function filterOrdersForUser(rows: any[], user: AuthUser): any[] {
-  if (user.role === "admin" || user.role === "rsd") return rows;
-  const aliases = user.salespersonAliases || [];
-  if (aliases.length === 0) return [];
-  return rows.filter((r) => rowMatchesAe(r, aliases));
 }
 
 // Resolve salesperson for every row that does not already have a Shopify-side
@@ -569,18 +557,18 @@ async function fetchOrdersFromShopify(shopifyQuery: string, count = 50, afterCur
 
 async function searchOrders(query: string, user: AuthUser) {
   const q = query.trim().toLowerCase();
-  // Salesperson on each row may need a Zoho lookup before role-filtering can
-  // run, since AE_SALESPERSONS aliases match the *resolved* rep name. We
-  // resolve, then filter, then strip private fields.
-  const scope = async (rows: any[]) => {
+  // Resolve the salesperson on each row (Shopify hints first, then Zoho) so
+  // admins/RSDs get the attribution field, then strip server-only fields. The
+  // result set itself is never narrowed by who is asking.
+  const finalize = async (rows: any[]) => {
     const counters = await resolveSalespersonForRows(rows);
     lastResolveByUser.set(user.email, { at: Date.now(), counters });
-    return filterOrdersForUser(rows, user).map((r) => stripPrivate(r, user));
+    return rows.map((r) => stripPrivate(r, user));
   };
 
   if (!q) {
     const nodes = await fetchOrdersFromShopify("", 50);
-    return scope(nodes.map(buildOrderRow));
+    return finalize(nodes.map(buildOrderRow));
   }
 
   // --- Comma-separated multi-order lookup (e.g. "EPI24737, EPI24769") ---
@@ -602,7 +590,7 @@ async function searchOrders(query: string, user: AuthUser) {
           }
         }
       }
-      return scope(merged.map(buildOrderRow));
+      return finalize(merged.map(buildOrderRow));
     }
   }
 
@@ -614,14 +602,14 @@ async function searchOrders(query: string, user: AuthUser) {
     const orderName = index.get(normalizedQ);
     if (!orderName) return [];
     const nodes = await fetchOrdersFromShopify(`name:${orderName}`);
-    return scope(nodes.map(buildOrderRow));
+    return finalize(nodes.map(buildOrderRow));
   }
 
   const orderNumMatch = q.match(/^#?(epi)?(\d+)$/i);
   if (orderNumMatch) {
     const num = orderNumMatch[2];
     const nodes = await fetchOrdersFromShopify(`name:#EPI${num}`);
-    return scope(nodes.map(buildOrderRow));
+    return finalize(nodes.map(buildOrderRow));
   }
 
   const words = q.split(/\s+/).filter(Boolean);
@@ -693,18 +681,13 @@ async function searchOrders(query: string, user: AuthUser) {
   }
 
   // Resolve salesperson for the merged result set (typically <= 250 rows; the
-  // Zoho cache absorbs most calls after the first search). We must resolve
-  // BEFORE role-filtering since AE matching is now done against the resolved
-  // salesperson name, not just the (usually empty) note segment.
+  // Zoho cache absorbs most calls after the first search) so admins/RSDs get
+  // the attribution field on each row.
   const mergedRows = Array.from(merged.values());
   const counters = await resolveSalespersonForRows(mergedRows);
   lastResolveByUser.set(user.email, { at: Date.now(), counters });
 
-  // Apply role-based filtering before the 50-row cap so that AEs can still
-  // get up to 50 of their own matches even when the wider merged set contains
-  // many rows that belong to other reps.
-  const filtered = filterOrdersForUser(mergedRows, user);
-  return filtered.slice(0, 50).map((r) => stripPrivate(r, user));
+  return mergedRows.slice(0, 50).map((r) => stripPrivate(r, user));
 }
 
 function stripPrivate(row: any, user: AuthUser) {
@@ -718,8 +701,9 @@ function stripPrivate(row: any, user: AuthUser) {
     _zohoSalesorder,
     ...rest
   } = row;
-  // Salesperson is an admin/RSD-only field: AEs can look up any order but do
-  // not need to see which other rep owns it.
+  // Salesperson is an admin/RSD-only *display* field (see #7). Every role can
+  // look up every order; only admin/RSD are shown who the order is attributed
+  // to. This is a field gate, not an access gate.
   if (user.role === "admin" || user.role === "rsd") {
     return { ...rest, salesperson: _salesperson || null };
   }
@@ -882,11 +866,13 @@ export function registerRoutes(_httpServer: Server, app: Express) {
     });
   });
 
-  // Admin/RSD-only: pre-launch audit that simulates what each configured AE
-  // would see if they logged in right now. Scans a bounded recent sample of
-  // Shopify orders, resolves salespersons through the same Zoho-aware
-  // pipeline as /api/orders/search, then applies the production AE filter
-  // (rowMatchesAe / filterOrdersForUser) to count matches per AE.
+  // Admin/RSD-only: salesperson attribution audit. Scans a bounded recent
+  // sample of Shopify orders, resolves salespersons through the same
+  // Zoho-aware pipeline as /api/orders/search, and reports how many orders in
+  // the sample are attributable to each configured AE. Order *visibility* is
+  // no longer derived from this — every authenticated user sees every order —
+  // so these counts describe data quality (are rep names recorded, do they
+  // match the roster?), not access.
   //
   // Never exposes order, customer, address, tracking, or invoice details.
   // Salesperson names are listed for the matched and unresolved buckets so
@@ -944,15 +930,13 @@ export function registerRoutes(_httpServer: Server, app: Express) {
         perSalesperson.set(name, (perSalesperson.get(name) || 0) + 1);
       }
 
-      // Per-AE simulation. We call the exact same rowMatchesAe used by the
-      // production filter so the count is a trustworthy preview of what the
-      // AE would see in /api/orders/search.
+      // Per-AE attribution counts across the sample.
       const aes = listConfiguredAes();
       const aeReports = aes.map((ae) => {
         let matched = 0;
         const matchedNames = new Set<string>();
         for (const r of rows) {
-          if (rowMatchesAe(r, ae.salespersonAliases)) {
+          if (rowAttributedToAe(r, ae.aliases)) {
             matched += 1;
             const sp = normalizeSalespersonValue(String(r._salesperson || ""));
             if (sp) matchedNames.add(sp);
@@ -960,8 +944,8 @@ export function registerRoutes(_httpServer: Server, app: Express) {
         }
         return {
           email: ae.email,
-          aliases: ae.salespersonAliases,
-          configured: ae.salespersonAliases.length > 0,
+          aliases: ae.aliases,
+          configured: ae.aliases.length > 0,
           matchedOrderCount: matched,
           matchedSalespersonNames: Array.from(matchedNames).sort(),
         };
@@ -970,10 +954,10 @@ export function registerRoutes(_httpServer: Server, app: Express) {
       // Pull resolved salesperson names that did NOT match any configured AE.
       // These are typically reps who don't yet have an AE_SALESPERSONS entry
       // or whose aliases are spelled differently. Showing the names lets an
-      // admin fix the config; no order or customer data is exposed.
+      // admin fix the roster; no order or customer data is exposed.
       const unmatchedResolvedNames: { name: string; count: number }[] = [];
       for (const [name, count] of perSalesperson.entries()) {
-        const matchesAny = aes.some((ae) => rowMatchesAe({ _salesperson: name }, ae.salespersonAliases));
+        const matchesAny = aes.some((ae) => rowAttributedToAe({ _salesperson: name }, ae.aliases));
         if (!matchesAny) unmatchedResolvedNames.push({ name, count });
       }
       unmatchedResolvedNames.sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
@@ -993,8 +977,8 @@ export function registerRoutes(_httpServer: Server, app: Express) {
         zoho: { configured: zohoConfigSummary().configured, cache: zohoCacheStats() },
         aes: aeReports,
         // Salesperson names present in Zoho/Shopify but not matched by any
-        // configured AE's aliases. Helpful before a launch: every name here
-        // is an order that no AE would see.
+        // configured AE's aliases — i.e. orders attributed to a name that is
+        // not on the roster. Useful for cleaning up rep attribution data.
         unmatchedResolvedNames,
       });
     } catch (err: any) {
@@ -1044,24 +1028,8 @@ export function registerRoutes(_httpServer: Server, app: Express) {
     }
     try {
       const query = (req.query.q as string) || "";
-      const user = req.authUser!;
-      const isAe = user.role === "ae";
-      const configured = isAe ? user.salespersonAliases.length > 0 : true;
-      // Skip the Shopify round-trip for unconfigured AEs — they would always
-      // get zero results, and we want the UI to surface "not configured"
-      // promptly without paying the Shopify latency.
-      const orders = isAe && !configured ? [] : await searchOrders(query, user);
-      res.json({
-        orders,
-        scope: {
-          role: user.role,
-          // restricted: server narrowed the result set by role.
-          restricted: isAe,
-          // configured: for AEs, whether AE_SALESPERSONS has any aliases for
-          // this user. Admins/RSDs are always considered configured.
-          configured,
-        },
-      });
+      const orders = await searchOrders(query, req.authUser!);
+      res.json({ orders });
     } catch (err: any) {
       console.error("Search error:", err?.message || err);
       res.status(500).json({ error: err?.message || "Search failed" });

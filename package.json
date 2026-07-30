@@ -11,6 +11,7 @@
     "build": "node script/build.mjs",
     "start": "NODE_ENV=production node dist/index.cjs",
     "check": "tsc",
+    "test": "node --import tsx --test server/*.test.ts",
     "db:push": "drizzle-kit push"
   },
   "dependencies": {
