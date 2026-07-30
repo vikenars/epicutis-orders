@@ -10,6 +10,9 @@ import {
   getSession,
   isAllowedDomain,
   isBlockedEmail,
+  listConfiguredAes,
+  matchesSalesperson,
+  normalizeSalespersonValue,
   resolveUserForEmail,
   roleConfigSummary,
   segmentLooksLikeSalesperson,
@@ -354,11 +357,18 @@ function buildOrderRow(o: any) {
     // in the rest via resolveSalespersonForRows().
     _shopifySalesperson: shopifySalesperson || "",
     // Final resolved salesperson (Shopify wins, then Zoho). Filled in by
-    // resolveSalespersonForRows() before stripPrivate() runs.
+    // resolveSalespersonForRows() before role-filtering / stripping happen.
     _salesperson: shopifySalesperson || "",
     _zohoInvoice: zohoRefs.invoice || "",
     _zohoSalesorder: zohoRefs.salesorder || "",
   };
+}
+
+// Attribution-only helper: does this order's resolved salesperson look like the
+// given AE? Used exclusively by the admin/RSD attribution audit below. It is
+// NOT an access control check — every authenticated user can see every order.
+function rowAttributedToAe(row: any, normalizedAliases: string[]): boolean {
+  return matchesSalesperson(String(row._salesperson || ""), normalizedAliases);
 }
 
 // Resolve salesperson for every row that does not already have a Shopify-side
@@ -488,6 +498,43 @@ async function fetchOrdersByFullTextSearch(query: string): Promise<any[]> {
   return fetchOrdersFromShopify(query, 50);
 }
 
+// Paginated fetch used by the AE-visibility diagnostic. Reuses the same
+// ORDER_GQL projection and access-token cache as the production search path
+// so the simulation sees the exact same data shape. Total is bounded by the
+// caller (max 1000) and each page is at most 250 (Shopify's per-page max).
+async function fetchOrdersForDiagnostics(
+  shopifyQuery: string,
+  total: number,
+): Promise<any[]> {
+  const token = await getAccessToken();
+  const PAGE = 250;
+  const out: any[] = [];
+  let cursor: string | null = null;
+  while (out.length < total) {
+    const pageSize = Math.min(PAGE, total - out.length);
+    const queryArg = shopifyQuery ? `, query: "${escapeGqlString(shopifyQuery)}"` : "";
+    const cursorArg = cursor ? `, after: "${escapeGqlString(cursor)}"` : "";
+    const gql = `{ orders(first: ${pageSize}, sortKey: CREATED_AT, reverse: true${queryArg}${cursorArg}) {
+      edges { cursor node ${ORDER_GQL_NODE} }
+      pageInfo { hasNextPage endCursor }
+    } }`;
+    const res = await fetch(shopifyApiUrl(`/admin/api/${SHOPIFY_API_VERSION}/graphql.json`), {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Shopify-Access-Token": token },
+      body: JSON.stringify({ query: gql }),
+    });
+    if (!res.ok) throw new Error("Shopify API request failed");
+    const data = (await res.json()) as any;
+    const orders = data?.data?.orders;
+    const edges: Array<{ cursor: string; node: any }> = orders?.edges || [];
+    for (const e of edges) out.push(e.node);
+    if (!orders?.pageInfo?.hasNextPage) break;
+    cursor = orders.pageInfo.endCursor || null;
+    if (!cursor) break;
+  }
+  return out;
+}
+
 // shopifyQuery is treated as a Shopify search-syntax string. We sanitize the
 // caller's arbitrary substrings before they reach this function; here we just
 // guard against accidental breakouts of the GraphQL string literal.
@@ -510,9 +557,10 @@ async function fetchOrdersFromShopify(shopifyQuery: string, count = 50, afterCur
 
 async function searchOrders(query: string, user: AuthUser) {
   const q = query.trim().toLowerCase();
-  // Resolve the salesperson on each row (Shopify hint, else a Zoho lookup) so
-  // the admin/RSD-only display column is populated, then strip private fields.
-  const project = async (rows: any[]) => {
+  // Resolve the salesperson on each row (Shopify hints first, then Zoho) so
+  // admins/RSDs get the attribution field, then strip server-only fields. The
+  // result set itself is never narrowed by who is asking.
+  const finalize = async (rows: any[]) => {
     const counters = await resolveSalespersonForRows(rows);
     lastResolveByUser.set(user.email, { at: Date.now(), counters });
     return rows.map((r) => stripPrivate(r, user));
@@ -520,7 +568,7 @@ async function searchOrders(query: string, user: AuthUser) {
 
   if (!q) {
     const nodes = await fetchOrdersFromShopify("", 50);
-    return project(nodes.map(buildOrderRow));
+    return finalize(nodes.map(buildOrderRow));
   }
 
   // --- Comma-separated multi-order lookup (e.g. "EPI24737, EPI24769") ---
@@ -542,7 +590,7 @@ async function searchOrders(query: string, user: AuthUser) {
           }
         }
       }
-      return project(merged.map(buildOrderRow));
+      return finalize(merged.map(buildOrderRow));
     }
   }
 
@@ -554,14 +602,14 @@ async function searchOrders(query: string, user: AuthUser) {
     const orderName = index.get(normalizedQ);
     if (!orderName) return [];
     const nodes = await fetchOrdersFromShopify(`name:${orderName}`);
-    return project(nodes.map(buildOrderRow));
+    return finalize(nodes.map(buildOrderRow));
   }
 
   const orderNumMatch = q.match(/^#?(epi)?(\d+)$/i);
   if (orderNumMatch) {
     const num = orderNumMatch[2];
     const nodes = await fetchOrdersFromShopify(`name:#EPI${num}`);
-    return project(nodes.map(buildOrderRow));
+    return finalize(nodes.map(buildOrderRow));
   }
 
   const words = q.split(/\s+/).filter(Boolean);
@@ -632,8 +680,14 @@ async function searchOrders(query: string, user: AuthUser) {
     if (!merged.has(row.orderName) && matchesQuery(row)) merged.set(row.orderName, row);
   }
 
-  const mergedRows = Array.from(merged.values()).slice(0, 50);
-  return project(mergedRows);
+  // Resolve salesperson for the merged result set (typically <= 250 rows; the
+  // Zoho cache absorbs most calls after the first search) so admins/RSDs get
+  // the attribution field on each row.
+  const mergedRows = Array.from(merged.values());
+  const counters = await resolveSalespersonForRows(mergedRows);
+  lastResolveByUser.set(user.email, { at: Date.now(), counters });
+
+  return mergedRows.slice(0, 50).map((r) => stripPrivate(r, user));
 }
 
 function stripPrivate(row: any, user: AuthUser) {
@@ -647,8 +701,9 @@ function stripPrivate(row: any, user: AuthUser) {
     _zohoSalesorder,
     ...rest
   } = row;
-  // Salesperson is an admin/RSD-only field. Every role can look up every
-  // order; AEs just don't get the rep attribution column.
+  // Salesperson is an admin/RSD-only *display* field (see #7). Every role can
+  // look up every order; only admin/RSD are shown who the order is attributed
+  // to. This is a field gate, not an access gate.
   if (user.role === "admin" || user.role === "rsd") {
     return { ...rest, salesperson: _salesperson || null };
   }
@@ -805,10 +860,131 @@ export function registerRoutes(_httpServer: Server, app: Express) {
           (Boolean(SHOPIFY_ADMIN_ACCESS_TOKEN) ||
             (Boolean(SHOPIFY_CLIENT_ID) && Boolean(SHOPIFY_CLIENT_SECRET))),
       },
-      // Counts only — never the actual emails.
+      // Counts only — never the actual emails or aliases.
       roles: roleConfigSummary(),
       zoho: zohoConfigSummary(),
     });
+  });
+
+  // Admin/RSD-only: salesperson attribution audit. Scans a bounded recent
+  // sample of Shopify orders, resolves salespersons through the same
+  // Zoho-aware pipeline as /api/orders/search, and reports how many orders in
+  // the sample are attributable to each configured AE. Order *visibility* is
+  // no longer derived from this — every authenticated user sees every order —
+  // so these counts describe data quality (are rep names recorded, do they
+  // match the roster?), not access.
+  //
+  // Never exposes order, customer, address, tracking, or invoice details.
+  // Salesperson names are listed for the matched and unresolved buckets so
+  // admins can spot misconfigured aliases ("Zoho says 'J Villegas' but the
+  // AE_SALESPERSONS entry only has 'JV'"). Salesperson strings are internal
+  // staff labels, not customer PII.
+  app.get("/api/diagnostics/ae-visibility", requireAuth, async (req: AuthedRequest, res) => {
+    const user = req.authUser!;
+    if (user.role !== "admin" && user.role !== "rsd") {
+      res.status(403).json({ error: "Forbidden" });
+      return;
+    }
+    if (!SHOPIFY_STORE_DOMAIN) {
+      res.status(503).json({ error: "Shopify is not configured: SHOPIFY_STORE_DOMAIN is missing." });
+      return;
+    }
+    if (
+      !SHOPIFY_ADMIN_ACCESS_TOKEN &&
+      !(SHOPIFY_CLIENT_ID && SHOPIFY_CLIENT_SECRET)
+    ) {
+      res.status(503).json({ error: "Shopify is not configured: missing access token or client credentials." });
+      return;
+    }
+
+    const DEFAULT_SAMPLE = 250;
+    const MAX_SAMPLE = 1000;
+    const sampleRaw = Number(req.query.sample ?? DEFAULT_SAMPLE);
+    const sample = Number.isFinite(sampleRaw)
+      ? Math.max(1, Math.min(MAX_SAMPLE, Math.floor(sampleRaw)))
+      : DEFAULT_SAMPLE;
+    const q = String(req.query.q || "").trim();
+
+    try {
+      // Build Shopify search string identically to /api/orders/search when q
+      // is a simple substring. We deliberately do NOT support all of the
+      // multi-source merge logic here (invoice index, note index, etc.) —
+      // those are search-UX features. For an audit we want a deterministic
+      // recent slice. If q is given, it narrows the sample.
+      const safeTerm = sanitizeShopifySearchTerm(q);
+      const shopifyQuery = safeTerm ? safeTerm : "";
+
+      const nodes = await fetchOrdersForDiagnostics(shopifyQuery, sample);
+      const rows = nodes.map(buildOrderRow);
+      // Resolve salesperson through the exact same pipeline as search. This
+      // populates row._salesperson from Shopify hints (if any) and the Zoho
+      // refs (when present), reusing the Zoho cache.
+      const counters = await resolveSalespersonForRows(rows);
+
+      // Aggregate per resolved salesperson name (lowercased). Used to build
+      // a count of "orders attributable to <name>" across the sample.
+      const perSalesperson = new Map<string, number>();
+      for (const r of rows) {
+        const name = normalizeSalespersonValue(String(r._salesperson || ""));
+        if (!name) continue;
+        perSalesperson.set(name, (perSalesperson.get(name) || 0) + 1);
+      }
+
+      // Per-AE attribution counts across the sample.
+      const aes = listConfiguredAes();
+      const aeReports = aes.map((ae) => {
+        let matched = 0;
+        const matchedNames = new Set<string>();
+        for (const r of rows) {
+          if (rowAttributedToAe(r, ae.aliases)) {
+            matched += 1;
+            const sp = normalizeSalespersonValue(String(r._salesperson || ""));
+            if (sp) matchedNames.add(sp);
+          }
+        }
+        return {
+          email: ae.email,
+          aliases: ae.aliases,
+          configured: ae.aliases.length > 0,
+          matchedOrderCount: matched,
+          matchedSalespersonNames: Array.from(matchedNames).sort(),
+        };
+      });
+
+      // Pull resolved salesperson names that did NOT match any configured AE.
+      // These are typically reps who don't yet have an AE_SALESPERSONS entry
+      // or whose aliases are spelled differently. Showing the names lets an
+      // admin fix the roster; no order or customer data is exposed.
+      const unmatchedResolvedNames: { name: string; count: number }[] = [];
+      for (const [name, count] of perSalesperson.entries()) {
+        const matchesAny = aes.some((ae) => rowAttributedToAe({ _salesperson: name }, ae.aliases));
+        if (!matchesAny) unmatchedResolvedNames.push({ name, count });
+      }
+      unmatchedResolvedNames.sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
+
+      res.json({
+        sample: {
+          requested: sample,
+          scanned: counters.scanned,
+          q: q || null,
+        },
+        resolver: {
+          withShopifySalesperson: counters.withShopifySalesperson,
+          withZohoRefs: counters.withZohoRefs,
+          resolvedFromZoho: counters.resolvedFromZoho,
+          unresolved: counters.unresolved,
+        },
+        zoho: { configured: zohoConfigSummary().configured, cache: zohoCacheStats() },
+        aes: aeReports,
+        // Salesperson names present in Zoho/Shopify but not matched by any
+        // configured AE's aliases — i.e. orders attributed to a name that is
+        // not on the roster. Useful for cleaning up rep attribution data.
+        unmatchedResolvedNames,
+      });
+    } catch (err: any) {
+      console.error("ae-visibility error:", err?.message || err);
+      res.status(500).json({ error: err?.message || "Diagnostics failed" });
+    }
   });
 
   // Admin/RSD-only diagnostics for the salesperson resolver. Reports aggregate

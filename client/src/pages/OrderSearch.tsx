@@ -36,8 +36,7 @@ interface Order {
   invoiceNumber: string;
   noteCustomer: string;
   orderType: string;
-  // Only populated for admin / RSD — resolved from the Shopify order note or
-  // the matching Zoho Books invoice.
+  // Attribution field the server sends to admin / RSD callers only.
   salesperson?: string | null;
 }
 
@@ -362,7 +361,8 @@ export default function OrderSearch({ user, onLogout }: OrderSearchProps = {}) {
   });
 
   const orders: Order[] = data?.orders || [];
-  // Every role searches every order; the rep attribution column is admin/RSD-only.
+  // Every role searches the same full set of orders; the Salesperson column is
+  // an admin/RSD-only field the server withholds from AEs.
   const showSalesperson = user?.role === "admin" || user?.role === "rsd";
 
   const handleKeyDown = (e: React.KeyboardEvent) => {

@@ -7,11 +7,12 @@ Internal Shopify order-search tool for the Epicutis / Signum Bio team.
 Access is gated by a 6-digit email-OTP flow (no shared password). On every
 sign-in:
 
-1. The user enters their work email. The server checks the domain
-   (`@epicutis.com` / `@signumbio.com`). Any allowed-domain user can request
-   a code; their role (and which fields they see) is decided server-side
-   from `ADMIN_EMAILS` / `RSD_EMAILS` — see
-   [Access control](#access-control) below.
+1. The user enters their work email. The server checks the denylist
+   (`BLOCKED_EMAILS`) and then the domain (`@epicutis.com` /
+   `@signumbio.com`). Any allowed-domain user can request a code; their role
+   (which decides which admin-only fields and routes they get, not which
+   orders they see) is resolved server-side from `ADMIN_EMAILS` /
+   `RSD_EMAILS` — see [Access control](#access-control) below.
 2. The server emails a 6-digit code via Resend (`RESEND_API_KEY`) with a
    10-minute TTL, 5-attempt cap, and a 30-second per-email cooldown.
 3. On verification, the server mints a Bearer session token (7-day sliding
@@ -40,6 +41,7 @@ server console so you can sign in locally without email setup. In
 | --- | --- | --- | --- |
 | GET | `/api/orders/search?q=…` | Bearer | Searches **all** Shopify orders. Returns `{ orders }`. |
 | GET | `/api/diagnostics/salesperson` | Bearer (admin/RSD) | Aggregate resolver counts. Counts only — never order or customer data. |
+| GET | `/api/diagnostics/ae-visibility` | Bearer (admin/RSD) | Per-AE attribution audit (see [AE attribution audit](#ae-attribution-audit)). |
 | GET | `/healthz` | none | Cheap liveness check (does not call Shopify). |
 | GET | `/health` | none | Alias for `/healthz`. |
 
@@ -55,10 +57,12 @@ deploy:
 - `RESEND_API_KEY` (production)
 - Optional: `ADMIN_EMAILS`, `SHOPIFY_API_VERSION`, `OTP_FROM_ADDRESS`,
   `OTP_REPLY_TO`, `RSD_EMAILS`, `BLOCKED_EMAILS`
-- Zoho Books — optional. Populates the admin/RSD-only `salesperson` column,
-  which is not encoded in Shopify itself (see
-  [Salesperson resolution](#salesperson-resolution) below). Order visibility
-  does not depend on it:
+- Optional: `AE_SALESPERSONS` — JSON map of AE email → salesperson aliases.
+  Used only by the admin/RSD attribution audit; it does not grant or withhold
+  order visibility. A missing entry costs nothing but audit coverage.
+- Zoho Books — optional; supplies the `salesperson` attribution shown to
+  admins/RSDs, which Shopify itself does not record (see
+  [Salesperson resolution](#salesperson-resolution) below):
   - `ZOHO_CLIENT_ID`
   - `ZOHO_CLIENT_SECRET`
   - `ZOHO_BOOKS_REFRESH_TOKEN` (alias `ZOHO_REFRESH_TOKEN` is also accepted)
@@ -70,17 +74,17 @@ Secrets are only ever read from `process.env`. Do not commit them.
 
 ## Access control
 
-Sign-in is gated by email-OTP on the allowed domains. Once signed in,
-**every user can see and search every order.** Role does not narrow the
-result set; it only controls the admin/RSD-only `salesperson` field and the
-diagnostics endpoints, and it is enforced server-side regardless of how the
-client is written.
+Order lookup is gated by **authentication only**. Any user who can sign in
+(not denylisted, allowed domain, valid OTP) can search every order and view
+its tracking. Role decides which admin-only *fields* and *routes* are
+available — never which orders come back.
 
-Order visibility is deliberately *not* tied to rep attribution. The
-salesperson recorded against an order is unreliable — frequently empty on
-Zoho Books invoices, and where present often taken from the customer account
-owner in arbitrary casing rather than the invoice itself. Gating on a name
-match meant legitimate reps signed in and saw nothing at all.
+This is deliberate. Salesperson attribution in the Epicutis data is
+unreliable: the field is frequently missing on orders, and where a name does
+exist it often reflects the customer's account owner in arbitrary casing
+rather than the actual rep. Gating visibility on that match meant legitimate
+reps signed in and saw nothing. Do not reintroduce a per-user order filter
+(see [History](#history-the-ae-salesperson-filter)).
 
 **Revoking access — `BLOCKED_EMAILS`.** A comma-separated denylist checked
 *before* the domain allowlist and all role logic. A blocked email cannot
@@ -93,24 +97,99 @@ authentication outright. Example: `BLOCKED_EMAILS=abitter@epicutis.com`. The
 list contents are never exposed by the diagnostics endpoints — only a count
 (`roles.blockedConfigured`).
 
-| Role  | How it is granted | Order search | Sensitive fields |
-| ----- | ----------------- | ------------ | ---------------- |
-| admin | Listed in `ADMIN_EMAILS` (env), or in the built-in default list in `server/auth.ts`. | All orders. | Sees `salesperson` and the diagnostics endpoints. |
-| rsd   | Listed in `RSD_EMAILS`. | All orders. | Sees `salesperson` and the diagnostics endpoints. |
-| ae    | Default for every other allowed-domain user. | All orders. | `salesperson` column hidden. |
+| Role  | How it is granted | Order search | Admin-only extras |
+| ----- | ----------------- | ------------ | ----------------- |
+| admin | Listed in `ADMIN_EMAILS` (env), or in the built-in default list in `server/auth.ts`. | All orders. | `salesperson` field; both `/api/diagnostics/*` role-gated routes. |
+| rsd   | Listed in `RSD_EMAILS`. | All orders. | Same as admin. |
+| ae    | Default for every other allowed-domain user. | All orders. | None — `salesperson` column hidden, diagnostics return 403. |
 
 The `salesperson` field on each row is resolved server-side
 (see [Salesperson resolution](#salesperson-resolution) for the full
 pipeline). It is added to the response **only when the caller is an admin
 or RSD**. AEs never receive it. The frontend mirrors this by hiding the
 `Salesperson` column for AEs, but the server is the source of truth — a
-client cannot add the field back.
+client cannot widen its own scope. This is a *field* gate: it changes what
+is shown about an order, not whether the order is returned.
 
-`/api/orders/search` returns `{ orders }`. There is no per-user scoping to
-report, so there is no `scope` object.
+`/api/orders/search` returns `{ "orders": [...] }`. There is no per-caller
+scope object, because the result set does not depend on the caller.
 
 `/api/diagnostics/auth` reports the size of each role list (counts only,
-never the actual emails).
+never the actual emails or aliases).
+
+### History: the AE salesperson filter
+
+Earlier versions restricted AEs to orders whose salesperson matched a
+per-user alias list (added in #6, removed in #8, restored "fail-closed" in
+#9). Under #9 an AE whose alias set matched nothing received an empty result
+set and a message telling them to ask an admin to fix their aliases — which
+is exactly what reps hit in production, because the underlying attribution
+data is sparse and inconsistent. The filter is gone; `AE_SALESPERSONS` now
+feeds reporting only.
+
+### Configuring `AE_SALESPERSONS`
+
+`AE_SALESPERSONS` is a JSON object mapping each AE's email (lowercased)
+to a list of aliases that should match the salesperson string Zoho or
+Shopify records on their orders. It is consumed only by the
+[AE attribution audit](#ae-attribution-audit).
+
+```json
+{
+  "jvillegas@epicutis.com": ["Jose Villegas", "JV"],
+  "rep@signumbio.com": ["Jane Doe"]
+}
+```
+
+#### Matching rules
+
+Before comparing, both sides are normalized: NFKD diacritic strip
+(`José` → `Jose`), parenthetical removal (`Jose Villegas (Epicutis)` →
+`Jose Villegas`), label stripping (`Salesperson: Jose Villegas`,
+`Rep — Jose`, `AE: Jose`), all non-alphanumerics collapsed to single
+spaces, lowercased. An order is attributed to an AE when, for their
+effective normalized alias set `A` and the normalized resolved salesperson
+`v`:
+
+1. `v === a` for some `a ∈ A`, **or**
+2. all tokens of some `a ∈ A` are present in `v`'s token set, **or**
+3. all tokens of `v` are present in some `a`'s token set, **or**
+4. `a` is a single token of ≥2 chars and `a ∈ tokens(v)`.
+
+The effective alias set is the configured aliases plus aliases derived
+from the email local part — `jvillegas@…` adds `jvillegas`,
+`j villegas`, `villegas j`; `first.last@…` adds `first last`, `last
+first`, `f last`, `last`. Surname-only is **not** derived from
+`flast`-style locals to avoid over-matching common surnames; list it
+explicitly in `AE_SALESPERSONS` if you want it.
+
+Examples (configured `["Jose Villegas","JV"]` + email
+`jvillegas@epicutis.com`):
+
+- `Jose Villegas` ✅
+- `VILLEGAS, JOSE` ✅
+- `Salesperson: Jose Villegas` ✅
+- `Jose Villegas (Epicutis)` ✅
+- `J. Villegas` ✅
+- `JV` ✅
+- `jvillegas` ✅
+- `Bob Stock` ❌
+
+An AE whose email is missing from this map — or whose entry has no
+aliases — simply does not appear in the attribution audit. Their order
+search is unaffected: they still see every order.
+
+#### Nickname expansions
+
+A small built-in table in `server/auth.ts`
+(`EMAIL_NICKNAME_ALIASES`) adds nicknames for AEs where production data
+shows Zoho/Shopify uses a form the configured aliases and email-derived
+aliases would not otherwise catch (e.g. `Mel Federico` on Melissa
+Federico's orders). **Only add entries here with explicit production
+evidence** — do not guess nicknames. Prefer extending
+`AE_SALESPERSONS` from the deploy environment when possible; the
+nickname table exists for the cases where the canonical email already
+encodes the formal first name.
 
 ## Salesperson resolution
 
@@ -145,10 +224,10 @@ that touches the same orders pays no Zoho cost. Zoho lookups are issued
 with bounded concurrency (8 in flight) so a wide text search of 50 rows
 that all miss the cache still resolves in a small handful of round-trips.
 
-If Zoho is not configured, everyone still sees every order — the
-`salesperson` column is simply empty for admin/RSD. The Zoho refresh-token
-flow is the only secret store — refresh tokens never leave `process.env`,
-access tokens only live in memory.
+If Zoho is not configured, everyone still sees every order; admin/RSD just
+get an unpopulated `salesperson` column and the attribution audit has
+nothing to report. The Zoho refresh-token flow is the only secret store —
+refresh tokens never leave `process.env`, access tokens only live in memory.
 
 ### Diagnostics
 
@@ -160,11 +239,111 @@ access tokens only live in memory.
   unresolved — plus Zoho cache size. No order names, customer info,
   references, or secret values are ever exposed.
 
+### AE attribution audit
+
+Reports how many orders in a recent sample are attributable to each AE on
+the roster. This is a **data-quality report, not an access check** — no AE's
+search results depend on it. The path keeps its original
+`ae-visibility` name so existing admin bookmarks keep working.
+
+```
+GET /api/diagnostics/ae-visibility?sample=250&q=
+Authorization: Bearer <admin-or-rsd-token>
+```
+
+The endpoint scans a bounded recent slice of Shopify orders (`sample`
+defaults to 250, max 1000), runs the orders through the **exact same**
+salesperson resolver used by `/api/orders/search`, and reports per-AE
+aggregates only:
+
+```json
+{
+  "sample":   { "requested": 250, "scanned": 250, "q": null },
+  "resolver": { "withShopifySalesperson": 0, "withZohoRefs": 248, "resolvedFromZoho": 246, "unresolved": 4 },
+  "zoho":     { "configured": true, "cache": { "size": 246, "positive": 246, "negative": 0 } },
+  "aes": [
+    {
+      "email": "jvillegas@epicutis.com",
+      "aliases": ["jose villegas", "jv"],
+      "configured": true,
+      "matchedOrderCount": 38,
+      "matchedSalespersonNames": ["jose villegas"]
+    }
+  ],
+  "unmatchedResolvedNames": [ { "name": "k. ramirez", "count": 17 } ]
+}
+```
+
+What admins do with it:
+
+- `matchedOrderCount = 0` for an AE with a real book of business → their
+  aliases in `AE_SALESPERSONS` do not match what Zoho returns. Compare
+  `aliases` against `unmatchedResolvedNames` to find the spelling Zoho
+  actually uses. The AE can still search everything meanwhile.
+- `unmatchedResolvedNames` lists rep names no roster entry covers.
+- `resolver.unresolved` tells you how many orders in the sample lack
+  both a Shopify-side salesperson hint and a working Zoho lookup — i.e.
+  orders with no attribution at all.
+- `q` accepts a substring (e.g. an order name prefix) to narrow the
+  sample to a specific area.
+
+The endpoint never returns order IDs, customer names, addresses,
+tracking, or invoice/sales-order numbers. Salesperson names are
+internal staff labels resolved from Zoho — they appear so the admin can
+diff them against `AE_SALESPERSONS` aliases. The Zoho cache is shared
+with the production search path, so running this audit will not double
+the load on Zoho if a search ran in the same TTL window.
+
+### Known unmapped Zoho salesperson values (operator notes)
+
+A production audit (`/api/diagnostics/ae-visibility?sample=1000`,
+2026-05-19) surfaced the following resolved Zoho salesperson values
+that did not correspond to any configured AE. Some are admins, RSDs,
+or inside-sales aliases where no AE mapping is expected. Others are
+real reps without an `AE_SALESPERSONS` entry — adding them improves
+attribution reporting only; every rep can already search every order.
+
+Reps that may need an `AE_SALESPERSONS` entry. Do **not** guess emails;
+ask the rep (or HR) for the canonical work email before adding:
+
+| Zoho salesperson | Observed count | Action |
+| --- | --- | --- |
+| Sheila McCrink | 12 | Confirm work email, add `AE_SALESPERSONS["<email>"] = ["Sheila McCrink"]`. |
+| Alma Hernandez-Gonzalez | 4 | Confirm work email. Hyphen is preserved by the normalizer as a space, so `"Alma Hernandez Gonzalez"` and `"Alma Hernandez-Gonzalez"` both match. |
+| Shannon OByrne | 2 | Confirm work email. Note Zoho writes the surname without the apostrophe. The normalizer treats `O'Byrne` and `OByrne` as the same token, so either spelling works once configured. |
+| Vivienne Davis | 1 | Confirm work email. |
+| Mel Federico | 1 | Already handled via `EMAIL_NICKNAME_ALIASES` for `mfederico@epicutis.com` (Melissa Federico). No action needed. |
+
+Values where no `AE_SALESPERSONS` entry is expected — admins/RSDs see
+all orders regardless, and inside-sales values typically aren't tied to
+a single AE: list those in the diagnostics output and skip.
+
+Workflow for adding a new alias:
+
+1. Get the canonical work email from HR or the rep directly. A guessed
+   email produces misleading attribution numbers (it grants no access —
+   `AE_SALESPERSONS` is reporting-only — but it credits one rep's orders
+   to another).
+2. In the deploy environment, extend `AE_SALESPERSONS` with the new
+   entry. Example JSON patch:
+
+   ```json
+   {
+     "smccrink@epicutis.com": ["Sheila McCrink"],
+     "ahernandez@epicutis.com": ["Alma Hernandez-Gonzalez", "Alma Hernandez Gonzalez"]
+   }
+   ```
+
+3. Redeploy (env changes are read at startup).
+4. Re-run `/api/diagnostics/ae-visibility` and confirm
+   `matchedOrderCount > 0` and the name now appears under
+   `matchedSalespersonNames` instead of `unmatchedResolvedNames`.
+
 ## Scripts
 
 - `npm run dev` — local development server (Vite + Express).
 - `npm run check` — TypeScript typecheck.
-- `npm test` — server tests (`node:test` via `tsx`).
+- `npm test` — server tests (`node --test` via `tsx`).
 - `npm run build` — production bundle.
 - `npm start` — run the production bundle.
 
