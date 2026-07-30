@@ -5,9 +5,9 @@
  *  - Only @epicutis.com / @signumbio.com may request a code.
  *  - Role is fail-closed: only emails explicitly listed in ADMIN_EMAILS (env
  *    or the built-in default list) get the admin role; only emails listed in
- *    RSD_EMAILS get the rsd role. Every other allowed-domain user is treated
- *    as an AE and only sees orders matching their AE_SALESPERSONS aliases.
- *    Unconfigured AEs see zero orders, not full data.
+ *    RSD_EMAILS get the rsd role. Every other allowed-domain user is an AE.
+ *    Role controls admin-only fields and diagnostics, not which orders are
+ *    reachable — every authenticated user can search all orders.
  *  - OTP codes are hash-stored, 10-minute TTL, 5-attempt cap per code.
  *  - 30s per-email cooldown between code requests.
  *  - No code is ever logged in production.
@@ -21,9 +21,6 @@ export interface AuthUser {
   email: string;
   label: string;
   role: UserRole;
-  // For AE users: lowercased name/alias tokens used to match the salesperson
-  // recorded on a Shopify order. Empty for admin / rsd.
-  salespersonAliases: string[];
 }
 
 // ── Domain allowlist ──────────────────────────────────────────────────────────
@@ -81,25 +78,18 @@ export function isAdminEmail(email: string): boolean {
 }
 
 // ── Role assignment (env-driven, fail-closed) ─────────────────────────────────
-// Three classes of access:
-//   - admin: full visibility. Granted ONLY to emails on the ADMIN_EMAILS
-//            allowlist (env override, else the built-in default list above).
-//   - rsd:   full visibility. Granted ONLY to emails in RSD_EMAILS.
-//   - ae:    restricted to orders whose salesperson matches the user's
-//            configured aliases in AE_SALESPERSONS. This is the default for
-//            every other allowed-domain user — including emails that are not
-//            mentioned in any of the three env lists. An AE with no aliases
-//            sees zero orders (fail-closed); the UI surfaces a clear
-//            "not configured" message in that case.
+// Every authenticated user can search all orders. Role only controls
+// admin-only fields and diagnostics:
+//   - admin: sees the resolved `salesperson` field and the diagnostics
+//            endpoints. Granted ONLY to emails on the ADMIN_EMAILS allowlist
+//            (env override, else the built-in default list above).
+//   - rsd:   same as admin. Granted ONLY to emails in RSD_EMAILS.
+//   - ae:    default for every other allowed-domain user. Full order search,
+//            without the admin-only `salesperson` field.
 //
 // Configuration:
 //   ADMIN_EMAILS       = "alice@x.com,bob@y.com" (comma list)
 //   RSD_EMAILS         = "carol@x.com,dave@y.com"
-//   AE_SALESPERSONS    = JSON object mapping email -> aliases, e.g.
-//                        {"jvillegas@epicutis.com":["Jose Villegas","JV"]}
-//                        The aliases are the strings written into the
-//                        salesperson position of a Shopify order note. They
-//                        are matched case-insensitively.
 
 function parseEmailListEnv(name: string): Set<string> {
   const raw = process.env[name] || "";
@@ -110,55 +100,14 @@ function parseEmailListEnv(name: string): Set<string> {
 
 const RSD_EMAIL_SET = parseEmailListEnv("RSD_EMAILS");
 
-function parseAeSalespersons(): Map<string, string[]> {
-  const raw = (process.env.AE_SALESPERSONS || "").trim();
-  if (!raw) return new Map();
-  try {
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== "object") return new Map();
-    const out = new Map<string, string[]>();
-    for (const [email, aliases] of Object.entries(parsed)) {
-      const e = String(email || "").trim().toLowerCase();
-      if (!e) continue;
-      const list = Array.isArray(aliases)
-        ? aliases
-            .map((s) => String(s || "").trim().toLowerCase())
-            .filter(Boolean)
-        : [];
-      out.set(e, list);
-    }
-    return out;
-  } catch (err) {
-    console.warn("[auth] AE_SALESPERSONS env is not valid JSON — ignoring");
-    return new Map();
-  }
-}
-
-const AE_SALESPERSON_MAP = parseAeSalespersons();
-
-// ── Salesperson normalization & matching ─────────────────────────────────────
+// ── Salesperson label parsing ────────────────────────────────────────────────
 // The salesperson field on a Shopify order note is hand-typed by operators and
-// shows up in many shapes: "Jose Villegas", "JOSE VILLEGAS", "Villegas, Jose",
-// "J. Villegas", "salesperson: Jose Villegas", "Jose Villegas (Epicutis)", etc.
-// We normalize aggressively before comparing so AE matching is robust against
-// punctuation, casing, accents, parentheticals, and common labels.
+// shows up in many shapes: "Jose Villegas", "salesperson: Jose Villegas",
+// "rep - J. Villegas". These helpers strip the label so the note parser can
+// surface a clean name for the admin/RSD-only display column.
 
 const SALESPERSON_LABEL_RE =
   /^(?:sales[\s_-]*person|sales[\s_-]*rep|salesrep|sales|rep|account[\s_-]*exec(?:utive)?|ae|owner|assigned[\s_-]*to)\s*[:\-–]\s*/i;
-
-export function normalizeSalespersonValue(raw: string): string {
-  if (!raw) return "";
-  let s = String(raw);
-  // Strip diacritics: "José" → "Jose"
-  s = s.normalize("NFKD").replace(/[̀-ͯ]/g, "");
-  // Drop anything inside parentheses/brackets: "Jose Villegas (Epicutis)" → "Jose Villegas"
-  s = s.replace(/[\(\[\{][^\)\]\}]*[\)\]\}]/g, " ");
-  // Strip common label prefixes like "salesperson:" / "rep -" / "AE:"
-  s = s.replace(SALESPERSON_LABEL_RE, "");
-  // Replace any non-alphanumeric with a space (handles commas, dots, dashes, slashes, apostrophes)
-  s = s.replace(/[^A-Za-z0-9]+/g, " ");
-  return s.trim().toLowerCase().replace(/\s+/g, " ");
-}
 
 // Best-effort detection of whether a pipe-segment value LOOKS like a labeled
 // salesperson field. Used by the note parser to find labeled values regardless
@@ -172,122 +121,6 @@ export function extractSalespersonFromSegment(segment: string): string {
   const m = s.match(SALESPERSON_LABEL_RE);
   if (!m) return s.trim();
   return s.slice(m[0].length).trim();
-}
-
-// Generate plausible aliases from an email address so matching can work out of
-// the box for newly added AEs who have not been entered in AE_SALESPERSONS yet.
-// For "jvillegas@epicutis.com" we produce candidates like "jvillegas",
-// "j villegas", "villegas j". Explicit aliases in AE_SALESPERSONS always take
-// precedence and are sufficient on their own.
-export function deriveAliasesFromEmail(email: string): string[] {
-  const e = (email || "").trim().toLowerCase();
-  const at = e.indexOf("@");
-  if (at <= 0) return [];
-  const local = e.slice(0, at);
-  // Strip plus-tags ("user+tag" → "user") and trailing digit suffixes.
-  const baseRaw = local.replace(/\+.*$/, "").replace(/\d+$/, "");
-  const base = baseRaw.replace(/[^a-z]/g, "");
-  if (!base) return [];
-
-  const aliases = new Set<string>();
-  aliases.add(base); // "jvillegas"
-
-  // dot/underscore/dash separator forms — "first.last" → first + last + "first last"
-  const sepMatch = baseRaw.match(/^([a-z]+)[._-]([a-z]+)$/);
-  if (sepMatch) {
-    const first = sepMatch[1];
-    const last = sepMatch[2];
-    if (first && last) {
-      aliases.add(`${first} ${last}`);
-      aliases.add(`${last} ${first}`);
-      aliases.add(`${first[0]} ${last}`);
-      aliases.add(`${first}${last}`);
-      aliases.add(last);
-    }
-    return Array.from(aliases);
-  }
-
-  // "flast" pattern — single leading initial + 3+ char surname → split it.
-  // Surname-only is intentionally NOT added (would over-match common surnames).
-  if (base.length >= 4 && base.length <= 24) {
-    const first = base[0];
-    const last = base.slice(1);
-    if (last.length >= 3) {
-      aliases.add(`${first} ${last}`);
-      aliases.add(`${last} ${first}`);
-    }
-  }
-  return Array.from(aliases);
-}
-
-// Known-nickname expansions, keyed by AE email. Only add entries here when
-// production data shows a Zoho/Shopify salesperson value uses a nickname that
-// the configured aliases and email-derived aliases would not otherwise catch
-// (e.g. "Mel Federico" appearing on Melissa Federico's orders). Each entry is
-// applied on top of the configured aliases and the email-derived set; do NOT
-// guess nicknames — only add entries with explicit production evidence.
-const EMAIL_NICKNAME_ALIASES: Record<string, string[]> = {
-  // Production audit (2026-05-19) recorded 1 order with salesperson
-  // "Mel Federico" while mfederico@epicutis.com is configured as
-  // "Melissa Federico". Both forms must hit.
-  "mfederico@epicutis.com": ["Mel Federico"],
-};
-
-// Combine the configured aliases for an AE with email-derived aliases plus any
-// explicit nickname expansions, all normalized. Returns a deduplicated array
-// of normalized alias strings.
-export function effectiveAliasesForUser(
-  email: string,
-  configuredAliases: string[],
-): string[] {
-  const set = new Set<string>();
-  for (const a of configuredAliases || []) {
-    const n = normalizeSalespersonValue(a);
-    if (n) set.add(n);
-  }
-  for (const a of deriveAliasesFromEmail(email)) {
-    const n = normalizeSalespersonValue(a);
-    if (n) set.add(n);
-  }
-  const nicknames = EMAIL_NICKNAME_ALIASES[(email || "").trim().toLowerCase()];
-  if (nicknames) {
-    for (const a of nicknames) {
-      const n = normalizeSalespersonValue(a);
-      if (n) set.add(n);
-    }
-  }
-  return Array.from(set);
-}
-
-// Match a normalized salesperson value against an AE's normalized aliases.
-// Accepts:
-//   - exact normalized equality;
-//   - token-set containment in either direction, so "jose villegas" matches
-//     "villegas jose" and "j villegas" matches "jose villegas";
-//   - single-token alias of ≥2 chars present as a whole token in the value.
-// Both sides are normalized first. The 1-char surname-only case is rejected.
-export function matchesSalesperson(
-  rawSalesperson: string,
-  normalizedAliases: string[],
-): boolean {
-  const value = normalizeSalespersonValue(rawSalesperson);
-  if (!value) return false;
-  const valueTokens = new Set(value.split(" ").filter(Boolean));
-  for (const alias of normalizedAliases) {
-    if (!alias) continue;
-    if (alias === value) return true;
-    const aliasTokens = alias.split(" ").filter(Boolean);
-    if (aliasTokens.length === 0) continue;
-    const aliasInValue = aliasTokens.every((t) => valueTokens.has(t));
-    if (aliasInValue) return true;
-    if (valueTokens.size > 0 && Array.from(valueTokens).every((t) => aliasTokens.includes(t))) {
-      return true;
-    }
-    if (aliasTokens.length === 1 && aliasTokens[0].length >= 2 && valueTokens.has(aliasTokens[0])) {
-      return true;
-    }
-  }
-  return false;
 }
 
 export function resolveRole(email: string): UserRole {
@@ -305,16 +138,7 @@ export function resolveUserForEmail(email: string): AuthUser | null {
   if (!e) return null;
   if (isBlockedEmail(e)) return null;
   if (!isAllowedDomain(e)) return null;
-  const role = resolveRole(e);
-  // For AEs, combine the explicit aliases from AE_SALESPERSONS with aliases
-  // auto-derived from the email local part. A newly added AE matches likely
-  // "first last" / "flast" / "first.last" variants of their email out of the
-  // box, while operators can still tighten or extend the list via
-  // AE_SALESPERSONS. Admin/RSD roles ignore aliases. Stored normalized so the
-  // matcher can compare directly without re-normalizing per request.
-  const salespersonAliases =
-    role === "ae" ? effectiveAliasesForUser(e, AE_SALESPERSON_MAP.get(e) || []) : [];
-  return { email: e, label: e, role, salespersonAliases };
+  return { email: e, label: e, role: resolveRole(e) };
 }
 
 // Diagnostic counts only — never the values themselves.
@@ -323,35 +147,7 @@ export function roleConfigSummary() {
     blockedConfigured: BLOCKED_EMAIL_SET.size,
     adminConfigured: ADMIN_EMAIL_SET.size,
     rsdConfigured: RSD_EMAIL_SET.size,
-    aeConfigured: AE_SALESPERSON_MAP.size,
-    aeWithAliases: Array.from(AE_SALESPERSON_MAP.values()).filter((v) => v.length > 0).length,
   };
-}
-
-// All configured AE users, as AuthUser records. Returned in stable order so
-// the admin/RSD-only visibility diagnostic produces deterministic output.
-// Includes AEs whose entry exists but has no aliases (configured:false from
-// the caller's perspective) so the diagnostic can flag them explicitly.
-export function listConfiguredAes(): AuthUser[] {
-  const out: AuthUser[] = [];
-  for (const [email, aliases] of AE_SALESPERSON_MAP.entries()) {
-    // Skip entries whose email is admin/RSD — those users see all orders
-    // regardless of AE_SALESPERSONS, so simulating AE scope for them would
-    // be misleading.
-    const role = resolveRole(email);
-    if (role !== "ae") continue;
-    // Store the effective normalized alias set so the audit endpoint runs the
-    // matcher against exactly what production would, including email-derived
-    // and any nickname aliases.
-    out.push({
-      email,
-      label: email,
-      role: "ae",
-      salespersonAliases: effectiveAliasesForUser(email, aliases),
-    });
-  }
-  out.sort((a, b) => a.email.localeCompare(b.email));
-  return out;
 }
 
 // ── OTP store ─────────────────────────────────────────────────────────────────
