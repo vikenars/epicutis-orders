@@ -1007,6 +1007,19 @@ export function registerRoutes(_httpServer: Server, app: Express) {
     });
   });
 
+  // ── Admin: list all configured AEs (for "View As" dropdown) ───────────────
+  app.get("/api/auth/ae-list", requireAuth, (req: AuthedRequest, res) => {
+    const user = req.authUser!;
+    if (user.role !== "admin") {
+      res.status(403).json({ error: "Forbidden" });
+      return;
+    }
+    const aes = listConfiguredAes()
+      .map((ae) => ({ email: ae.email }))
+      .sort((a, b) => a.email.localeCompare(b.email));
+    res.json({ aes });
+  });
+
   // ── Order search (auth required) ───────────────────────────────────────────
   app.get("/api/orders/search", requireAuth, async (req: AuthedRequest, res) => {
     if (!SHOPIFY_STORE_DOMAIN) {
@@ -1028,8 +1041,22 @@ export function registerRoutes(_httpServer: Server, app: Express) {
     }
     try {
       const query = (req.query.q as string) || "";
-      const orders = await searchOrders(query, req.authUser!);
-      res.json({ orders });
+      const caller = req.authUser!;
+
+      // Admin-only: "View As" — impersonate an AE's perspective.
+      // Only affects the response shape (hides salesperson column);
+      // order visibility is unchanged (all orders are always returned).
+      let effectiveUser = caller;
+      const viewAs = String(req.query.viewAs || "").trim().toLowerCase();
+      if (viewAs && caller.role === "admin") {
+        const resolved = resolveUserForEmail(viewAs);
+        if (resolved) {
+          effectiveUser = resolved;
+        }
+      }
+
+      const orders = await searchOrders(query, effectiveUser);
+      res.json({ orders, viewingAs: effectiveUser.email !== caller.email ? effectiveUser.email : undefined });
     } catch (err: any) {
       console.error("Search error:", err?.message || err);
       res.status(500).json({ error: err?.message || "Search failed" });

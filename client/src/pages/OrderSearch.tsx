@@ -5,7 +5,7 @@ import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Search, Package, ExternalLink, Moon, Sun, ChevronRight, Mic, MicOff, LogOut } from "lucide-react";
+import { Search, Package, ExternalLink, Moon, Sun, ChevronRight, Mic, MicOff, LogOut, Users, X } from "lucide-react";
 
 interface LineItem {
   title: string;
@@ -259,6 +259,98 @@ interface OrderSearchProps {
   onLogout?: () => void;
 }
 
+function ViewAsSelector({
+  currentViewAs,
+  onSelect,
+}: {
+  currentViewAs: string | null;
+  onSelect: (email: string | null) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [filter, setFilter] = useState("");
+  const ref = useRef<HTMLDivElement>(null);
+
+  const { data } = useQuery({
+    queryKey: ["/api/auth/ae-list"],
+    queryFn: async () => {
+      const r = await apiRequest("GET", "/api/auth/ae-list");
+      return r.json();
+    },
+    staleTime: 5 * 60_000,
+  });
+
+  const aes: { email: string }[] = data?.aes || [];
+  const filtered = filter
+    ? aes.filter((ae) => ae.email.toLowerCase().includes(filter.toLowerCase()))
+    : aes;
+
+  // Close on outside click
+  useEffect(() => {
+    if (!open) return;
+    const handler = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [open]);
+
+  return (
+    <div ref={ref} className="relative">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        title={currentViewAs ? `Viewing as ${currentViewAs}` : "View as AE"}
+        data-testid="button-view-as"
+        className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium transition-colors ${
+          currentViewAs
+            ? "bg-amber-100 dark:bg-amber-900/40 text-amber-800 dark:text-amber-300 hover:bg-amber-200 dark:hover:bg-amber-900/60"
+            : "bg-secondary text-muted-foreground hover:text-foreground hover:bg-secondary/80"
+        }`}
+      >
+        <Users size={13} />
+        {currentViewAs ? currentViewAs.split("@")[0] : "View as"}
+      </button>
+
+      {open && (
+        <div className="absolute right-0 top-full mt-1 w-64 rounded-xl border border-border bg-card shadow-lg z-50">
+          <div className="p-2 border-b border-border">
+            <Input
+              autoFocus
+              placeholder="Filter AEs…"
+              value={filter}
+              onChange={(e) => setFilter(e.target.value)}
+              className="h-7 text-xs"
+            />
+          </div>
+          <div className="max-h-60 overflow-y-auto py-1">
+            {currentViewAs && (
+              <button
+                className="w-full text-left px-3 py-1.5 text-xs text-destructive hover:bg-secondary/50 flex items-center gap-1.5"
+                onClick={() => { onSelect(null); setOpen(false); setFilter(""); }}
+              >
+                <X size={11} /> Clear — view as myself
+              </button>
+            )}
+            {filtered.length === 0 && (
+              <p className="px-3 py-2 text-xs text-muted-foreground">No matches</p>
+            )}
+            {filtered.map((ae) => (
+              <button
+                key={ae.email}
+                className={`w-full text-left px-3 py-1.5 text-xs hover:bg-secondary/50 transition-colors ${
+                  ae.email === currentViewAs ? "font-semibold text-primary" : "text-foreground"
+                }`}
+                onClick={() => { onSelect(ae.email); setOpen(false); setFilter(""); }}
+              >
+                {ae.email}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function roleLabel(role?: string): string | null {
   if (!role) return null;
   if (role === "ae") return "AE";
@@ -274,8 +366,10 @@ export default function OrderSearch({ user, onLogout }: OrderSearchProps = {}) {
   const [isListening, setIsListening] = useState(false);
   const [speechSupported, setSpeechSupported] = useState(false);
   const [micError, setMicError] = useState<string | null>(null);
+  const [viewAs, setViewAs] = useState<string | null>(null);
   const recognitionRef = useRef<any>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const isAdmin = user?.role === "admin";
 
   useEffect(() => {
     const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
@@ -343,10 +437,12 @@ export default function OrderSearch({ user, onLogout }: OrderSearchProps = {}) {
   }, [isListening, handleSearch]);
 
   const { data, isFetching, isError } = useQuery({
-    queryKey: ["/api/orders/search", searchQuery],
+    queryKey: ["/api/orders/search", searchQuery, viewAs],
     queryFn: async () => {
       try {
-        const r = await apiRequest("GET", `/api/orders/search?q=${encodeURIComponent(searchQuery)}`);
+        const params = new URLSearchParams({ q: searchQuery });
+        if (viewAs) params.set("viewAs", viewAs);
+        const r = await apiRequest("GET", `/api/orders/search?${params.toString()}`);
         return await r.json();
       } catch (err: any) {
         if (typeof err?.message === "string" && err.message.startsWith("401")) {
@@ -361,9 +457,8 @@ export default function OrderSearch({ user, onLogout }: OrderSearchProps = {}) {
   });
 
   const orders: Order[] = data?.orders || [];
-  // Every role searches the same full set of orders; the Salesperson column is
-  // an admin/RSD-only field the server withholds from AEs.
-  const showSalesperson = user?.role === "admin" || user?.role === "rsd";
+  // Salesperson column: shown for admin/RSD, hidden when impersonating an AE.
+  const showSalesperson = (user?.role === "admin" || user?.role === "rsd") && !viewAs;
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "Enter") handleSearch();
@@ -403,6 +498,9 @@ export default function OrderSearch({ user, onLogout }: OrderSearchProps = {}) {
                 )}
               </div>
             )}
+            {isAdmin && (
+              <ViewAsSelector currentViewAs={viewAs} onSelect={setViewAs} />
+            )}
             <ThemeToggle />
             {onLogout && (
               <button
@@ -418,6 +516,23 @@ export default function OrderSearch({ user, onLogout }: OrderSearchProps = {}) {
           </div>
         </div>
       </header>
+
+      {/* View As banner */}
+      {viewAs && (
+        <div className="bg-amber-50 dark:bg-amber-900/30 border-b border-amber-200 dark:border-amber-800">
+          <div className="max-w-screen-2xl mx-auto px-6 py-2 flex items-center justify-between">
+            <span className="text-xs text-amber-800 dark:text-amber-300 font-medium">
+              Viewing as <strong>{viewAs}</strong> — Salesperson column hidden, search results reflect AE perspective
+            </span>
+            <button
+              onClick={() => setViewAs(null)}
+              className="text-xs text-amber-700 dark:text-amber-400 hover:text-amber-900 dark:hover:text-amber-200 flex items-center gap-1 ml-4"
+            >
+              <X size={12} /> Exit
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Search bar */}
       <div className="bg-card border-b border-border">
