@@ -1,15 +1,22 @@
 import { QueryClient, QueryFunction } from "@tanstack/react-query";
+import { touchSession } from "./session";
 
 const API_BASE = "__PORT_5000__".startsWith("__") ? "" : "__PORT_5000__";
 
-// Module-level token storage. Set after a successful OTP verify; read by
-// apiRequest and the default React Query queryFn so the Bearer header is
-// attached transparently. Kept in module scope (not localStorage/cookies) so
-// auth is always memory-only — a refresh logs the user out by design.
+// Module-level token storage. Set after a successful OTP verify or after the
+// stored session is rehydrated on startup; read by apiRequest and the default
+// React Query queryFn so the Bearer header is attached transparently. The
+// durable copy lives in localStorage — see ./session.
 let authToken: string | null = null;
 
 export function setAuthToken(token: string | null) {
   authToken = token;
+}
+
+// Every successful authenticated call slides the stored deadline forward, so
+// the local window tracks the server's sliding expiry.
+function noteAuthenticatedSuccess(res: Response) {
+  if (authToken && res.ok) touchSession();
 }
 
 export function getAuthToken(): string | null {
@@ -46,6 +53,7 @@ export async function apiRequest(
     body: data ? JSON.stringify(data) : undefined,
   });
 
+  noteAuthenticatedSuccess(res);
   await throwIfResNotOk(res);
   return res;
 }
@@ -58,6 +66,7 @@ export const getQueryFn: <T>(options: {
   async ({ queryKey }) => {
     const headers: Record<string, string> = { ...(getAuthHeader() || {}) };
     const res = await fetch(`${API_BASE}${queryKey.join("/")}`, { headers });
+    noteAuthenticatedSuccess(res);
 
     if (unauthorizedBehavior === "returnNull" && res.status === 401) {
       return null;

@@ -15,11 +15,37 @@ sign-in:
    `RSD_EMAILS` — see [Access control](#access-control) below.
 2. The server emails a 6-digit code via Resend (`RESEND_API_KEY`) with a
    10-minute TTL, 5-attempt cap, and a 30-second per-email cooldown.
-3. On verification, the server mints a Bearer session token (7-day sliding
+3. On verification, the server mints a Bearer session token (12-hour sliding
    TTL, kept in process memory) which the client attaches to every API call.
 
-The token is stored in React state only — refreshing the page logs you out.
-That avoids `localStorage` / cookie footguns in iframed previews.
+### Session lifetime
+
+A sign-in lasts **12 hours, sliding**: every authenticated request pushes the
+deadline out another 12 hours, so a working day never interrupts you, but 12
+hours of inactivity signs you out. The server enforces the window
+(`SESSION_TTL_MS` in `server/auth.ts`) and hands the same value to the browser
+as `sessionTtlMs`, so the two never drift.
+
+The token is mirrored into `localStorage` (`epicutis.orders.session.v1`), so
+reloads, back-navigation and new tabs resume the session instead of asking for
+another emailed code. On startup the app replays the stored token against
+`GET /api/auth/me` and takes the identity **and role** from that response — the
+stored copy is never trusted on its own, so a resumed session is
+indistinguishable from a fresh sign-in and can never carry a role the server
+would not grant right now. An expired, revoked or corrupt record drops straight
+to the sign-in screen. Where `localStorage` is unavailable (Safari private
+mode, sandboxed iframes) the app silently falls back to the old memory-only
+behaviour rather than failing to load.
+
+Two consequences worth knowing:
+
+- **Sessions do not survive a server restart or redeploy.** The session store is
+  a process-memory `Map`, so a Railway deploy signs everyone out and they need
+  a fresh code. Making sessions durable would mean adding real persistence
+  (Redis, Postgres, or a mounted Railway volume) — the repo has none today.
+- A single `401` on one request no longer tears the session down. The client
+  re-checks `/api/auth/me` first and only returns to the sign-in screen if the
+  token itself is genuinely rejected.
 
 In **development** with no `RESEND_API_KEY`, the OTP code is logged to the
 server console so you can sign in locally without email setup. In
@@ -30,8 +56,8 @@ server console so you can sign in locally without email setup. In
 | Method | Path | Auth | Notes |
 | --- | --- | --- | --- |
 | POST | `/api/auth/request-otp` | none | Body: `{ email }`. Sends a code if the email is on an allowed domain. |
-| POST | `/api/auth/verify-otp` | none | Body: `{ email, code }`. Returns `{ token, user }`. |
-| GET | `/api/auth/me` | Bearer | Returns the current `{ user }`. |
+| POST | `/api/auth/verify-otp` | none | Body: `{ email, code }`. Returns `{ token, user, sessionTtlMs }`. |
+| GET | `/api/auth/me` | Bearer | Returns `{ user, sessionTtlMs }`. Used to resume a stored session; 401 means sign in again. |
 | POST | `/api/auth/logout` | Bearer | Invalidates the current token. |
 | GET | `/api/diagnostics/auth` | none | Non-secret diagnostic info. |
 
@@ -88,9 +114,11 @@ reps signed in and saw nothing. Do not reintroduce a per-user order filter
 
 **Revoking access — `BLOCKED_EMAILS`.** A comma-separated denylist checked
 *before* the domain allowlist and all role logic. A blocked email cannot
-request an OTP, cannot verify one, and any session token already issued to it
-is invalidated on its next request — all three paths return `403 {"error":
-"This account has been disabled."}`. This is the correct way to fully revoke
+request an OTP, cannot verify one (both return `403 {"error": "This account has
+been disabled."}`), and any session token already issued to it is invalidated
+on its next request (`401`). The denylist is re-evaluated on *every* request,
+not just at sign-in, so blocking someone still takes effect immediately even
+though a session now lives for 12 hours. This is the correct way to fully revoke
 someone: removing them from `RSD_EMAILS`/`ADMIN_EMAILS` only downgrades their
 role (they would still sign in as an AE), whereas `BLOCKED_EMAILS` denies
 authentication outright. Example: `BLOCKED_EMAILS=abitter@epicutis.com`. The
