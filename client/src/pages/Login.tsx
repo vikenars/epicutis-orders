@@ -7,7 +7,7 @@ export interface AuthUser {
 }
 
 interface LoginProps {
-  onLogin: (token: string, user: AuthUser) => void;
+  onLogin: (token: string, user: AuthUser, sessionTtlMs?: number) => void;
 }
 
 export default function Login({ onLogin }: LoginProps) {
@@ -56,8 +56,12 @@ export default function Login({ onLogin }: LoginProps) {
         const body = await res.json().catch(() => ({} as { error?: string }));
         throw new Error(body.error || "Invalid code.");
       }
-      const data = (await res.json()) as { token: string; user: AuthUser };
-      onLogin(data.token, data.user);
+      const data = (await res.json()) as {
+        token: string;
+        user: AuthUser;
+        sessionTtlMs?: number;
+      };
+      onLogin(data.token, data.user, data.sessionTtlMs);
     } catch (err: any) {
       setError(err?.message || "Invalid code.");
     } finally {

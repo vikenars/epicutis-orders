@@ -257,6 +257,7 @@ function OrderRow({ order, idx, showSalesperson }: { order: Order; idx: number; 
 interface OrderSearchProps {
   user?: { email: string; label: string; role?: "admin" | "rsd" | "ae" } | null;
   onLogout?: () => void;
+  onAuthFailure?: () => void;
 }
 
 function ViewAsSelector({
@@ -359,7 +360,7 @@ function roleLabel(role?: string): string | null {
   return null;
 }
 
-export default function OrderSearch({ user, onLogout }: OrderSearchProps = {}) {
+export default function OrderSearch({ user, onLogout, onAuthFailure }: OrderSearchProps = {}) {
   const [inputValue, setInputValue] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
   const [hasSearched, setHasSearched] = useState(false);
@@ -446,8 +447,10 @@ export default function OrderSearch({ user, onLogout }: OrderSearchProps = {}) {
         return await r.json();
       } catch (err: any) {
         if (typeof err?.message === "string" && err.message.startsWith("401")) {
-          // Session expired — punt back to the login gate.
-          onLogout?.();
+          // Might be an expired session, might be one bad call. Ask the app to
+          // re-check the token; it signs out only if the token is really dead,
+          // so a stray 401 no longer takes the whole session down with it.
+          onAuthFailure?.();
         }
         throw err;
       }

@@ -17,7 +17,8 @@ import {
   roleConfigSummary,
   segmentLooksLikeSalesperson,
   sendOtpEmail,
-  SESSION_TTL_DAYS,
+  SESSION_TTL_HOURS,
+  SESSION_TTL_MS,
   storeOtp,
   verifyOtp,
 } from "./auth";
@@ -827,11 +828,16 @@ export function registerRoutes(_httpServer: Server, app: Express) {
       return;
     }
     const token = createSession(result.user);
-    res.json({ token, user: publicUser(result.user) });
+    res.json({ token, user: publicUser(result.user), sessionTtlMs: SESSION_TTL_MS });
   });
 
+  // Session rehydration. requireAuth has already re-applied the denylist and
+  // expiry checks and slid the window, so a 200 here means the stored token is
+  // still good and the user it returns is the authoritative one — a client that
+  // resumes from this response is indistinguishable from one that just signed
+  // in. A 401 means the client must fall back to the sign-in screen.
   app.get("/api/auth/me", requireAuth, (req: AuthedRequest, res) => {
-    res.json({ user: publicUser(req.authUser!) });
+    res.json({ user: publicUser(req.authUser!), sessionTtlMs: SESSION_TTL_MS });
   });
 
   app.post("/api/auth/logout", requireAuth, (req: AuthedRequest, res) => {
@@ -847,7 +853,7 @@ export function registerRoutes(_httpServer: Server, app: Express) {
       otp: {
         enabled: true,
         provider: process.env.RESEND_API_KEY ? "resend" : "console (dev)",
-        sessionTtlDays: SESSION_TTL_DAYS,
+        sessionTtlHours: SESSION_TTL_HOURS,
       },
       shopify: {
         storeDomainSet: Boolean(SHOPIFY_STORE_DOMAIN),

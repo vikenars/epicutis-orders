@@ -410,7 +410,11 @@ export function verifyOtp(email: string, code: string): VerifyResult {
 }
 
 // ── Sessions (Bearer tokens) ──────────────────────────────────────────────────
-const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days, sliding
+// 12 hours, sliding: every authenticated request pushes the deadline out again,
+// so a working day never interrupts you, but 12 hours of inactivity signs you
+// out. The client mirrors this window locally (see client/src/lib/session.ts)
+// using the value handed back by the auth endpoints, so the two never drift.
+export const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
 
 interface Session {
   user: AuthUser;
@@ -448,7 +452,7 @@ export function deleteSession(token: string): void {
   if (token) sessions.delete(token);
 }
 
-export const SESSION_TTL_DAYS = SESSION_TTL_MS / (24 * 60 * 60 * 1000);
+export const SESSION_TTL_HOURS = SESSION_TTL_MS / (60 * 60 * 1000);
 
 // Periodic cleanup of expired records.
 setInterval(() => {
