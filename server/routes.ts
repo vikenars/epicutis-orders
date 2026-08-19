@@ -211,10 +211,14 @@ function buildFulfillmentMap(fulfillments: any[]): Map<string, { trackingNumber:
     const trackingNumber = f.trackingInfo?.[0]?.number || null;
     const trackingUrl = f.trackingInfo?.[0]?.url || null;
     const deliveredAt = f.deliveredAt
-      ? new Date(f.deliveredAt).toLocaleDateString("en-US", { month: "short", day: "numeric" })
+      ? new Date(f.deliveredAt).toLocaleDateString("en-US", { month: "short", day: "numeric", timeZone: "UTC" })
       : null;
     const estDelivery = f.estimatedDeliveryAt
-      ? new Date(f.estimatedDeliveryAt).toLocaleDateString("en-US", { month: "short", day: "numeric" })
+      // Shopify stores estimatedDeliveryAt as end-of-day local time in UTC
+      // (e.g. "Aug 20 23:59 PDT" becomes "Aug 21 06:59 UTC"). Subtract 12 h
+      // before formatting so we always show the correct local calendar date.
+      ? new Date(new Date(f.estimatedDeliveryAt).getTime() - 12 * 60 * 60 * 1000)
+          .toLocaleDateString("en-US", { month: "short", day: "numeric", timeZone: "UTC" })
       : null;
     const delivery = deliveredAt ? `Delivered ${deliveredAt}` : estDelivery ? `Est. ${estDelivery}` : null;
     for (const edge of f.fulfillmentLineItems?.edges || []) {
@@ -310,10 +314,11 @@ function buildOrderRow(o: any) {
   const trackingNumber = fulfillment?.trackingInfo?.[0]?.number || null;
   const trackingUrl = fulfillment?.trackingInfo?.[0]?.url || null;
   const estDelivery = fulfillment?.estimatedDeliveryAt
-    ? new Date(fulfillment.estimatedDeliveryAt).toLocaleDateString("en-US", { month: "short", day: "numeric" })
+    ? new Date(new Date(fulfillment.estimatedDeliveryAt).getTime() - 12 * 60 * 60 * 1000)
+        .toLocaleDateString("en-US", { month: "short", day: "numeric", timeZone: "UTC" })
     : null;
   const deliveredAt = fulfillment?.deliveredAt
-    ? new Date(fulfillment.deliveredAt).toLocaleDateString("en-US", { month: "short", day: "numeric" })
+    ? new Date(fulfillment.deliveredAt).toLocaleDateString("en-US", { month: "short", day: "numeric", timeZone: "UTC" })
     : null;
   const fulfillmentMap = buildFulfillmentMap(fulfillments);
 
