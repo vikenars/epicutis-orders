@@ -82,13 +82,54 @@ function sanitizeShopifySearchTerm(s: string): string {
   return String(s).replace(/[^A-Za-z0-9 .#@_*\-]/g, "");
 }
 
+// POST a GraphQL document to Shopify with retries. Transient failures
+// (network errors, 5xx, "upstream connect error" text bodies, throttling) are
+// retried with backoff; anything that still fails throws a clear error instead
+// of trying to JSON-parse a non-JSON body.
+async function shopifyGql(gql: string, attempts = 3): Promise<any> {
+  let lastErr: any = null;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const token = await getAccessToken();
+      const res = await fetch(shopifyApiUrl(`/admin/api/${SHOPIFY_API_VERSION}/graphql.json`), {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Shopify-Access-Token": token },
+        body: JSON.stringify({ query: gql }),
+      });
+      const text = await res.text();
+      if (res.status === 401 || res.status === 403) {
+        // Token may have been revoked/expired — drop the cache so the next try re-issues one.
+        cachedToken = null;
+        tokenExpiry = 0;
+      }
+      if (!res.ok) throw new Error(`Shopify HTTP ${res.status}: ${text.slice(0, 120)}`);
+      let data: any;
+      try {
+        data = JSON.parse(text);
+      } catch {
+        throw new Error(`Shopify returned non-JSON: ${text.slice(0, 120)}`);
+      }
+      const throttled = Array.isArray(data?.errors) && data.errors.some((e: any) => e?.extensions?.code === "THROTTLED");
+      if (throttled) throw new Error("Shopify throttled");
+      return data;
+    } catch (err: any) {
+      lastErr = err;
+      if (i < attempts - 1) await new Promise((r) => setTimeout(r, 500 * 2 ** i));
+    }
+  }
+  throw lastErr;
+}
+
 async function getInvoiceIndex(): Promise<Map<string, string>> {
   const now = Date.now();
   if (invoiceIndex && now - invoiceIndexBuiltAt < INVOICE_INDEX_TTL) return invoiceIndex;
-  if (invoiceIndexBuilding) { await invoiceIndexBuilding; return invoiceIndex!; }
+  if (invoiceIndexBuilding) {
+    try { await invoiceIndexBuilding; } catch { /* handled below */ }
+    if (invoiceIndex) return invoiceIndex;
+    throw new Error("Order index is temporarily unavailable");
+  }
 
-  invoiceIndexBuilding = (async () => {
-    const token = await getAccessToken();
+  const build = (async () => {
     const inv = new Map<string, string>();
     const notes = new Map<string, string>();
     let cursor: string | null = null;
@@ -100,15 +141,10 @@ async function getInvoiceIndex(): Promise<Map<string, string>> {
         edges { node { name note } }
         pageInfo { hasNextPage endCursor }
       } }`;
-
-      const res = await fetch(shopifyApiUrl(`/admin/api/${SHOPIFY_API_VERSION}/graphql.json`), {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "X-Shopify-Access-Token": token },
-        body: JSON.stringify({ query: gql }),
-      });
-      const data = (await res.json()) as any;
-      const orders = data.data?.orders;
-      for (const edge of orders?.edges || []) {
+      const data = await shopifyGql(gql);
+      const orders = data?.data?.orders;
+      if (!orders) throw new Error(`Shopify returned no orders data: ${JSON.stringify(data?.errors || data).slice(0, 160)}`);
+      for (const edge of orders.edges || []) {
         const { name, note } = edge.node;
         if (note) {
           const match = note.match(/inv[-\s]?(\d+)/i);
@@ -116,8 +152,9 @@ async function getInvoiceIndex(): Promise<Map<string, string>> {
           notes.set(name, note.toLowerCase());
         }
       }
-      hasMore = orders?.pageInfo?.hasNextPage;
-      cursor = orders?.pageInfo?.endCursor || null;
+      hasMore = !!orders.pageInfo?.hasNextPage;
+      cursor = orders.pageInfo?.endCursor || null;
+      if (!cursor) hasMore = false;
     }
 
     invoiceIndex = inv;
@@ -125,9 +162,23 @@ async function getInvoiceIndex(): Promise<Map<string, string>> {
     invoiceIndexBuiltAt = Date.now();
     console.log(`[invoice-index] Built: ${inv.size} invoices, ${notes.size} notes indexed`);
   })();
+  invoiceIndexBuilding = build;
 
-  await invoiceIndexBuilding;
-  invoiceIndexBuilding = null;
+  try {
+    await build;
+  } catch (err: any) {
+    console.error(`[invoice-index] Build failed: ${err?.message || err}`);
+    // Never leave a failed build cached. Keep serving the previous index if we
+    // have one (and retry in ~2 min); otherwise surface the error for this
+    // request only — the next request will try again from scratch.
+    if (invoiceIndex) {
+      invoiceIndexBuiltAt = Date.now() - INVOICE_INDEX_TTL + 2 * 60 * 1000;
+      return invoiceIndex;
+    }
+    throw err;
+  } finally {
+    invoiceIndexBuilding = null;
+  }
   return invoiceIndex!;
 }
 
@@ -512,7 +563,6 @@ async function fetchOrdersForDiagnostics(
   shopifyQuery: string,
   total: number,
 ): Promise<any[]> {
-  const token = await getAccessToken();
   const PAGE = 250;
   const out: any[] = [];
   let cursor: string | null = null;
@@ -524,13 +574,7 @@ async function fetchOrdersForDiagnostics(
       edges { cursor node ${ORDER_GQL_NODE} }
       pageInfo { hasNextPage endCursor }
     } }`;
-    const res = await fetch(shopifyApiUrl(`/admin/api/${SHOPIFY_API_VERSION}/graphql.json`), {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Shopify-Access-Token": token },
-      body: JSON.stringify({ query: gql }),
-    });
-    if (!res.ok) throw new Error("Shopify API request failed");
-    const data = (await res.json()) as any;
+    const data = await shopifyGql(gql);
     const orders = data?.data?.orders;
     const edges: Array<{ cursor: string; node: any }> = orders?.edges || [];
     for (const e of edges) out.push(e.node);
@@ -545,19 +589,11 @@ async function fetchOrdersForDiagnostics(
 // caller's arbitrary substrings before they reach this function; here we just
 // guard against accidental breakouts of the GraphQL string literal.
 async function fetchOrdersFromShopify(shopifyQuery: string, count = 50, afterCursor?: string): Promise<any[]> {
-  const token = await getAccessToken();
   const queryArg = shopifyQuery ? `, query: "${escapeGqlString(shopifyQuery)}"` : "";
   const cursorArg = afterCursor ? `, after: "${escapeGqlString(afterCursor)}"` : "";
   const gql = `{ orders(first: ${count}, sortKey: CREATED_AT, reverse: true${queryArg}${cursorArg}) ${ORDER_GQL} }`;
 
-  const res = await fetch(shopifyApiUrl(`/admin/api/${SHOPIFY_API_VERSION}/graphql.json`), {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "X-Shopify-Access-Token": token },
-    body: JSON.stringify({ query: gql }),
-  });
-
-  if (!res.ok) throw new Error("Shopify API request failed");
-  const data = (await res.json()) as any;
+  const data = await shopifyGql(gql);
   return data?.data?.orders?.edges?.map((e: any) => e.node) || [];
 }
 
@@ -640,7 +676,10 @@ async function searchOrders(query: string, user: AuthUser) {
     safeTerm ? fetchOrdersByFullTextSearch(safeTerm) : Promise.resolve([] as any[]),
     safeTerm ? fetchOrdersFromShopify(`shipping_address:*${safeTerm}*`, 50) : Promise.resolve([] as any[]),
     fetchOrdersFromShopify("", 250),
-    getNoteIndex(),
+    getNoteIndex().catch((err) => {
+      console.error(`[search] note index unavailable, continuing without it: ${err?.message || err}`);
+      return new Map<string, string>();
+    }),
   ]);
 
   const recentRows = recentOrders.map(buildOrderRow);
